@@ -14,7 +14,7 @@
 static const char *const font_files[FONTS] = {"sa0:data/font/pgf/ltn0.pgf", "sa0:data/font/pgf/jpn0.pgf"};
 static SceFontLibHandle lib;
 static SceFontHandle fonts[FONTS];
-static float ascent[FONTS];       /* pixels above the baseline at the fonts' own size */
+static float cap_top[FONTS];      /* a capital H's height at the fonts' own size */
 static int state;                 /* 0 not tried, 1 ready, -1 unavailable */
 static uint8_t buf[BUF_W * BUF_W];
 
@@ -47,6 +47,7 @@ static int font_init(void)
     }
     for (int i = 0; i < FONTS; i++) {
         SceFontInfo info;
+        SceFontCharInfo cap;
         fonts[i] = sceFontOpenUserFile(lib, (char *)font_files[i], 1, &err);
         if (!fonts[i]) {
             plat_log("fonts: cannot open %s: 0x%08x\n", font_files[i], err);
@@ -54,9 +55,15 @@ static int font_init(void)
         }
         memset(&info, 0, sizeof(info));
         sceFontGetFontInfo(fonts[i], &info);
-        ascent[i] = info.maxGlyphAscenderF > 1.0f ? info.maxGlyphAscenderF : 14.0f;
-        plat_log("fonts: %s, ascender %.1f, height %.1f px\n", font_files[i], info.maxGlyphAscenderF,
-                 info.maxGlyphHeightF);
+        /* Letters are sized from a real capital, not the font's tallest glyph, which an accent
+           or a kanji decides and which could leave the letters clipped or too small. */
+        memset(&cap, 0, sizeof(cap));
+        if (sceFontGetCharInfo(fonts[i], 'H', &cap) >= 0 && (int)cap.bitmapTop > 0)
+            cap_top[i] = (float)(int)cap.bitmapTop;
+        else
+            cap_top[i] = info.maxGlyphAscenderF > 1.0f ? info.maxGlyphAscenderF * 0.75f : 11.0f;
+        plat_log("fonts: %s, ascender %.1f, height %.1f px, capital %.1f px\n", font_files[i], info.maxGlyphAscenderF,
+                 info.maxGlyphHeightF, cap_top[i]);
         opened++;
     }
     return opened ? 1 : -1;
@@ -71,7 +78,9 @@ int plat_glyph(uint32_t cp, int px, uint8_t *alpha)
     for (int i = 0; i < FONTS; i++) {
         SceFontCharInfo ci;
         SceFontGlyphImage img;
-        int w = 2 * px, base = px - px / 8, advance;
+        /* In the px rows: a capital about 72% of them, with room above it for tall letters and
+           a fifth below the baseline for the tails of g, p and y. */
+        int w = 2 * px, base = (px * 4 + 2) / 5, advance;
         float f;
 
         if (!fonts[i] || sceFontGetCharInfo(fonts[i], cp, &ci) < 0)
@@ -80,7 +89,7 @@ int plat_glyph(uint32_t cp, int px, uint8_t *alpha)
             continue;                          /* not in this font */
         if (ci.bitmapWidth > BUF_W || ci.bitmapHeight > BUF_W)
             continue;
-        f = (float)base / ascent[i];           /* the font's ascender to the 8x8 font's */
+        f = (float)px * 0.72f / cap_top[i];
         advance = (int)(ci.sfp26AdvanceH / 64.0f * f + 0.5f);
         if (advance <= 0)
             continue;
