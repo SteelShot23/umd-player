@@ -20,6 +20,7 @@ static library *lib;
 static player *current;
 static disc *current_disc;    /* "Start with: Disc" on a disc with menus */
 static char current_path[512];
+static char lib_dir[512];     /* the library's folders, to open it again for a rescan */
 static player_options direct = {.title = -1, .audio = -1};
 static int intros[INTRO_MAX], intro_count, intro_next;   /* "Start with: Disc" */
 
@@ -59,7 +60,8 @@ int app_init(int argc, char **argv)
         current = player_open(&direct);
         return current ? 0 : 1;
     }
-    lib = library_open(path);
+    snprintf(lib_dir, sizeof(lib_dir), "%s", path);
+    lib = library_open(lib_dir);
     return lib ? 0 : 1;
 }
 
@@ -175,6 +177,11 @@ int app_frame(void)
     pick = library_update(lib, pressed);
     if (pick == -2)
         return 0;
+    if (pick == -3) {                /* Settings, Rescan: the library reads every disc again */
+        library_close(lib);
+        lib = library_open(lib_dir);
+        return lib != NULL;
+    }
     if (pick >= 0) {
         player_options opt = {.title = -1, .audio = -1};
         snprintf(current_path, sizeof(current_path), "%.511s", library_path(lib, pick));

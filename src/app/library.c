@@ -185,6 +185,8 @@ struct library {
        cache_lock), and library_update shows them as they come. */
     plat_thread *scanner;
     int scanning, scan_total, scan_read, scan_quit;
+    int scan_force;                  /* read every disc, not its saved scan */
+    int rescan;                      /* Settings, Rescan: tell the app to open the library again */
     uint64_t scan_start_us, last_loading_us;
     int loaded;                      /* disc whose media is in use, or -1 */
 
@@ -940,6 +942,106 @@ static void sound_fill(void *user, int16_t *out, int frames)
     plat_mutex_unlock(l->lock);
 }
 
+/* ---- what a scan learned, kept between runs ---- */
+
+/* cache/<the image's name>.bin in the data folder: this, the poster if any, then the icon. Reading
+   it takes a fraction of the time of opening the disc and decoding its pictures. New discs have
+   none, so they are read as they appear; Settings, Rescan reads them all again. */
+#define DISC_CACHE_MAGIC 0x31434D55u
+#define DISC_CACHE_ICON_MAX (512 * 512 * 4)
+enum { CACHED_POSTER = 1, CACHED_INCOMPLETE = 2, CACHED_NO_MOVIE = 4, CACHED_INTERACTIVE = 8 };
+
+typedef struct disc_cache_head {
+    uint32_t magic;
+    int32_t icon_w, icon_h, flags;
+    char title[96];
+} disc_cache_head;
+
+static void disc_cache_name(const lib_disc *disc, char *name, size_t size)
+{
+    char *dot;
+
+    snprintf(name, size, "cache/%.220s", file_name(disc->path));
+    if ((dot = strrchr(name, '.')) != NULL && dot > name + 6)
+        *dot = 0;
+    strcat(name, ".bin");
+}
+
+/* Fills in the disc from its cache file. Returns 1, or 0 if it has no good one. */
+static int load_disc_cache(lib_disc *disc)
+{
+    char name[240], *file;
+    size_t poster_size = POSTER_W * POSTER_H * 4, max = sizeof(disc_cache_head) + poster_size + DISC_CACHE_ICON_MAX;
+    size_t icon_size, want;
+    disc_cache_head h;
+    uint8_t *poster = NULL, *icon = NULL;
+    int n, ok = 0;
+
+    disc_cache_name(disc, name, sizeof(name));
+    if ((file = malloc(max)) == NULL)
+        return 0;
+    n = plat_data_load(name, file, (int)max);
+    if (n < (int)sizeof(h))
+        goto done;
+    memcpy(&h, file, sizeof(h));
+    if (h.magic != DISC_CACHE_MAGIC || h.icon_w < 0 || h.icon_h < 0 || h.icon_w > 512 || h.icon_h > 512)
+        goto done;
+    icon_size = (size_t)h.icon_w * (size_t)h.icon_h * 4;
+    want = sizeof(h) + ((h.flags & CACHED_POSTER) ? poster_size : 0) + icon_size;
+    if ((size_t)n != want)
+        goto done;
+    if ((h.flags & CACHED_POSTER) && (poster = malloc(poster_size)) == NULL)
+        goto done;
+    if (icon_size && (icon = malloc(icon_size)) == NULL) {
+        free(poster);
+        goto done;
+    }
+    if (poster)
+        memcpy(poster, file + sizeof(h), poster_size);
+    if (icon)
+        memcpy(icon, file + sizeof(h) + (poster ? poster_size : 0), icon_size);
+    h.title[sizeof(h.title) - 1] = 0;
+    snprintf(disc->title, sizeof(disc->title), "%s", h.title);
+    disc->poster = poster;
+    disc->icon0 = icon;
+    disc->icon_w = h.icon_w;
+    disc->icon_h = h.icon_h;
+    disc->incomplete = (h.flags & CACHED_INCOMPLETE) != 0;
+    disc->no_movie = (h.flags & CACHED_NO_MOVIE) != 0;
+    disc->interactive = (h.flags & CACHED_INTERACTIVE) != 0;
+    ok = 1;
+done:
+    free(file);
+    return ok;
+}
+
+static void save_disc_cache(const lib_disc *disc)
+{
+    char name[240], *file;
+    disc_cache_head h;
+    size_t poster_size = disc->poster ? POSTER_W * POSTER_H * 4 : 0;
+    size_t icon_size = disc->icon0 ? (size_t)disc->icon_w * (size_t)disc->icon_h * 4 : 0;
+
+    if (icon_size > DISC_CACHE_ICON_MAX || (file = malloc(sizeof(h) + poster_size + icon_size)) == NULL)
+        return;
+    memset(&h, 0, sizeof(h));
+    h.magic = DISC_CACHE_MAGIC;
+    h.icon_w = icon_size ? disc->icon_w : 0;
+    h.icon_h = icon_size ? disc->icon_h : 0;
+    h.flags = (disc->poster ? CACHED_POSTER : 0) | (disc->incomplete ? CACHED_INCOMPLETE : 0) |
+              (disc->no_movie ? CACHED_NO_MOVIE : 0) | (disc->interactive ? CACHED_INTERACTIVE : 0);
+    snprintf(h.title, sizeof(h.title), "%s", disc->title);
+    memcpy(file, &h, sizeof(h));
+    if (poster_size)
+        memcpy(file + sizeof(h), disc->poster, poster_size);
+    if (icon_size)
+        memcpy(file + sizeof(h) + poster_size, disc->icon0, icon_size);
+    disc_cache_name(disc, name, sizeof(name));
+    if (plat_data_save(name, file, (int)(sizeof(h) + poster_size + icon_size)) < 0)
+        plat_log("library: cannot save %s\n", name);
+    free(file);
+}
+
 /* ---- the media cache ---- */
 
 static media *find_media(library *l, int disc)
@@ -1449,7 +1551,7 @@ static void fill_icon_corners(library *l)
 
 /* ---- the settings panel (△) ---- */
 
-enum { SET_START, SET_SCREEN, SET_AUDIO, SET_SUBS, SET_SHEETS, SET_LOGS, SET_SKIP, SET_ROWS };
+enum { SET_START, SET_SCREEN, SET_AUDIO, SET_SUBS, SET_SHEETS, SET_LOGS, SET_SKIP, SET_RESCAN, SET_ROWS };
 
 static int lang_index(const char *code)
 {
@@ -1475,6 +1577,12 @@ static void settings_input(library *l, uint32_t pressed)
         l->settings_row = (l->settings_row + SET_ROWS - 1) % SET_ROWS;
     if (pressed & PLAT_BTN_DOWN)
         l->settings_row = (l->settings_row + 1) % SET_ROWS;
+    if ((pressed & PLAT_BTN_CROSS) && l->settings_row == SET_RESCAN) {
+        l->settings_open = 0;
+        settings_save();
+        l->rescan = 1;
+        return;
+    }
     if (dir && l->settings_row == SET_START) {
         s->start_disc = !s->start_disc;
     } else if (dir && l->settings_row == SET_SCREEN) {
@@ -1541,6 +1649,11 @@ static void draw_settings(library *l)
     v.rows[SET_SKIP].icon = ICON_FORWARD;
     snprintf(v.rows[SET_SKIP].label, sizeof(v.rows[0].label), "Skip clips");
     snprintf(v.rows[SET_SKIP].value, sizeof(v.rows[0].value), "%s", s->skip_clips ? "On" : "Off");
+    v.rows[SET_RESCAN].icon = ICON_FORWARD;
+    snprintf(v.rows[SET_RESCAN].label, sizeof(v.rows[0].label), "Library");
+    snprintf(v.rows[SET_RESCAN].value, sizeof(v.rows[0].value), "Rescan all discs");
+    if (l->settings_row == SET_RESCAN)
+        snprintf(v.cross_hint, sizeof(v.cross_hint), "Rescan");
     osd_draw_menu(&v, &l->ui);
 }
 
@@ -1673,10 +1786,10 @@ static void draw_details(library *l)
     canvas_round_darken(c, SHELF_X - 6, SHELF_BIG_Y - 8, UI_W - SHELF_X - 8, 370, 12, 110);
     lines = wrap_title(info && info->name[0] ? info->name : d->title, l1, l2, sizeof(l1), w);
     canvas_text(c, x, y, 2, RGBA(255, 255, 255, 255), l1);
-    y += 20;
+    y += 22;
     if (lines > 1) {
         canvas_text(c, x, y, 2, RGBA(255, 255, 255, 255), l2);
-        y += 20;
+        y += 22;
     }
     y += 2;
     l->details_more = 0;
@@ -1706,7 +1819,7 @@ static void draw_details(library *l)
     }
     y += 6;
     l->details_more = draw_wrapped(c, x, y, 2, RGBA(255, 255, 255, 255), info->about, w, l->details_scroll,
-                                   (DETAILS_TEXT_END - y) / 20, 20);
+                                   (DETAILS_TEXT_END - y) / 22, 22);
     if (l->details_more || l->details_scroll > 0) {
         snprintf(line, sizeof(line), "Up/Down: more");
         canvas_text(c, UI_W - 24 - canvas_text_width(line, 1), DETAILS_TEXT_END + 2, 1, RGBA(120, 190, 255, 255), line);
@@ -1758,14 +1871,14 @@ static void draw_shelf(library *l)
     canvas_round_darken(c, SHELF_X - 6, top - 8, SHELF_TILES * SHELF_STEP, 84, 10, 90);
     canvas_text(c, SHELF_X + 4, top, 2, RGBA(255, 255, 255, 255), l1);
     if (lines > 1)
-        canvas_text(c, SHELF_X + 4, top + 20, 2, RGBA(255, 255, 255, 255), l2);
+        canvas_text(c, SHELF_X + 4, top + 22, 2, RGBA(255, 255, 255, 255), l2);
     if (d->details && d->details->facts[0]) {
         fit_title(t, sizeof(t), d->details->facts, 1, SHELF_TILES * SHELF_STEP - 24);
-        canvas_text(c, SHELF_X + 4, top + 42, 1, RGBA(255, 255, 255, 255), t);
+        canvas_text(c, SHELF_X + 4, top + 45, 1, RGBA(255, 255, 255, 255), t);
     }
     disc_status(d, line, sizeof(line));
     if (line[0])
-        canvas_text(c, SHELF_X + 4, top + 58, 1, d->no_movie || d->incomplete ? RGBA(255, 120, 100, 255) : TEXT_DIM, line);
+        canvas_text(c, SHELF_X + 4, top + 60, 1, d->no_movie || d->incomplete ? RGBA(255, 120, 100, 255) : TEXT_DIM, line);
     if (shelf_moving(l))                     /* captions wait until the row rests */
         return;
     if (d->details && d->details->about[0]) {
@@ -1810,7 +1923,7 @@ static void draw_list(library *l)
     canvas_round_darken(c, BIG_X, y, 2 * ICON_W, 84, 10, 90);
     canvas_text(c, BIG_X + 8, y + 6, 2, RGBA(255, 255, 255, 255), l1);
     if (lines > 1)
-        canvas_text(c, BIG_X + 8, y + 26, 2, RGBA(255, 255, 255, 255), l2);
+        canvas_text(c, BIG_X + 8, y + 28, 2, RGBA(255, 255, 255, 255), l2);
     disc_status(d, line, sizeof(line));
     if (line[0])
         canvas_text(c, BIG_X + 8, y + 50, 1, d->no_movie || d->incomplete ? RGBA(255, 120, 100, 255) : TEXT_DIM, line);
@@ -2281,7 +2394,11 @@ static void scan_main(void *user)
         plat_mutex_unlock(l->cache_lock);
         if (l->scan_quit)
             return;
-        read_disc_info(&l->discs[i]);     /* not shown yet: only this thread touches it */
+        /* not shown yet: only this thread touches it */
+        if (l->scan_force || !load_disc_cache(&l->discs[i])) {
+            read_disc_info(&l->discs[i]);
+            save_disc_cache(&l->discs[i]);
+        }
         plat_mutex_lock(l->cache_lock);
         l->scan_read = i + 1;
         plat_mutex_unlock(l->cache_lock);
@@ -2386,6 +2503,8 @@ static void sheets_update(library *l)
     }
 }
 
+static int rescan_next;             /* the library opened next reads every disc again */
+
 /* Lists the disc images in every folder and starts the scan thread on them. Only called
    while the library is empty, so the worker has nothing to read. */
 static void start_scan(library *l)
@@ -2431,6 +2550,8 @@ static void start_scan(library *l)
     l->scan_total = ctx.count;
     l->scan_read = 0;
     l->scan_quit = 0;
+    l->scan_force = rescan_next;
+    rescan_next = 0;
     plat_mutex_unlock(l->cache_lock);
     l->scanning = 1;
     l->scan_start_us = plat_time_us();
@@ -2832,11 +2953,11 @@ static void draw_letter(library *l)
 {
     canvas *c = &l->ui;
     char s[2] = {disc_letter(&l->discs[l->sel]), 0};
-    int scale = 10, w = canvas_text_width(s, scale), x = BIG_X + ICON_W, y = BIG_Y + ICON_H;
+    int scale = 4, w = canvas_text_width(s, scale), x = BIG_X + ICON_W, y = BIG_Y + ICON_H;
 
     if (!l->letter_shown)
         return;
-    canvas_round_darken(c, x - 70, y - 70, 140, 140, 16, 160);
+    canvas_round_darken(c, x - 40, y - 40, 80, 80, 16, 160);
     canvas_text(c, x - w / 2, y - 4 * scale, scale, RGBA(255, 255, 255, 255), s);
 }
 
@@ -2980,6 +3101,10 @@ int library_update(library *l, uint32_t pressed)
     if (l->settings_open) {
         settings_input(l, pressed);
         pressed = 0;
+    }
+    if (l->rescan) {
+        rescan_next = 1;
+        return -3;
     }
     if (pressed & PLAT_BTN_CIRCLE) {
         details_open = !details_open;
