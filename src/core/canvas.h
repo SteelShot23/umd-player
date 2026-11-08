@@ -20,6 +20,7 @@ void canvas_rect(canvas *c, int x, int y, int w, int h, uint32_t rgba);
    ASCII uses the 8x8 font at scale (pixels per font pixel); other characters come from the
    glyph source when one is set, else accented Latin letters draw as their base letter and the
    rest as '?'. */
+#define CANVAS_SCALE_BODY 5           /* as a scale: reading text, a little smaller than scale 2 */
 int canvas_text(canvas *c, int x, int y, int scale, uint32_t rgba, const char *s);
 int canvas_text_width(const char *s, int scale);
 /* Copies as much of s as fits in max_w pixels, cut between characters. */

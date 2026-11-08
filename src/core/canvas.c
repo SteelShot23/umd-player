@@ -114,7 +114,7 @@ static canvas_glyph_fn glyph_source;
 static cached_glyph *cache[CACHE_SLOTS];
 /* ASCII at each small scale, kept for good: nearly all the text there is, and a slot of the cache
    above lost to a collision would mean asking the font again on every redraw. */
-#define ASCII_SCALES 4
+#define ASCII_SCALES 5
 static cached_glyph *ascii_cache[ASCII_SCALES][95];
 
 void canvas_set_glyph_source(canvas_glyph_fn fn)
@@ -156,7 +156,7 @@ static const cached_glyph *lookup(uint32_t cp, int px)
    8x8 font's, so these are taller than 8 * scale to match its capitals; draw_char centres them. */
 static int text_px(int scale)
 {
-    return scale == 1 ? 13 : scale == 2 ? 22 : 8 * scale;
+    return scale == 1 ? 13 : scale == 2 ? 22 : scale == CANVAS_SCALE_BODY ? 20 : 8 * scale;
 }
 
 /* The source's glyph for a printable ASCII character, or NULL to use the 8x8 font. */
@@ -235,21 +235,22 @@ static void draw_alpha(canvas *c, int x, int y, uint32_t rgba, const cached_glyp
 static int draw_char(canvas *c, int x, int y, int scale, uint32_t rgba, uint32_t cp)
 {
     const cached_glyph *g;
+    int cell = scale == CANVAS_SCALE_BODY ? 2 : scale;   /* pixels per pixel of the 8x8 font */
 
     if (cp < 0x80) {
         if ((g = ascii_lookup(cp, scale)) == NULL) {
             if (c) {
-                glyph(c, x + 1, y + 1, scale, SHADOW, (unsigned char)cp);
-                glyph(c, x, y, scale, rgba, (unsigned char)cp);
+                glyph(c, x + 1, y + 1, cell, SHADOW, (unsigned char)cp);
+                glyph(c, x, y, cell, rgba, (unsigned char)cp);
             }
-            return 8 * scale;
+            return 8 * cell;
         }
     } else {
         g = lookup(cp, text_px(scale));
     }
     if (g) {
         if (c) {
-            int up = (g->px - 8 * scale) / 2;
+            int up = (g->px - 8 * cell) / 2;
             draw_alpha(c, x + 1, y + 1 - up, SHADOW, g);
             draw_alpha(c, x, y - up, rgba, g);
         }
