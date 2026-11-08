@@ -267,7 +267,10 @@ void canvas_darken(canvas *c, int x, int y, int w, int h, int level)
 
     /* Black at alpha 1 - level/256 over each pixel: on an opaque one, its colour times level;
        on a transparent one (a layer the GPU puts over the background), translucent black. */
-    int a = 256 - level;
+    int a = 256 - level, clear_a = a * 255 / 256;
+    /* A transparent pixel, most of a panel on the GPU's layer, becomes this: the general case below
+       gives the same with three divisions a pixel, which the Vita's CPU does in software. */
+    const uint8_t clear[4] = {0, 0, 0, (uint8_t)(clear_a > 255 ? 255 : clear_a)};
 
     for (int yy = y0; yy < y1; yy++) {
         uint8_t *row = c->rgba + (size_t)yy * c->stride;
@@ -276,6 +279,10 @@ void canvas_darken(canvas *c, int x, int y, int w, int h, int level)
             if (p[3] == 255) {
                 for (int k = 0; k < 3; k++)
                     p[k] = (uint8_t)(p[k] * level >> 8);
+                continue;
+            }
+            if (p[3] == 0) {
+                memcpy(p, clear, 4);
                 continue;
             }
             {
