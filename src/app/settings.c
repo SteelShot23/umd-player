@@ -67,6 +67,8 @@ app_settings *settings_get(void)
             continue;
         if (strcmp(key, "view") == 0 && sscanf(value, "%d", &view) == 1 && view >= 0 && view < LIB_VIEWS)
             s.lib_view = view;
+        else if (strcmp(key, "tab") == 0)
+            s.lib_tab = strcmp(value, "tv") == 0;
         else if (strcmp(key, "screen") == 0 && sscanf(value, "%d", &screen) == 1 && screen >= 0 && screen < SCREEN_MODES)
             s.screen = screen;
         else if (strcmp(key, "audio") == 0 && strlen(value) == 2)
@@ -90,9 +92,9 @@ app_settings *settings_get(void)
 void settings_save(void)
 {
     const app_settings *s = settings_get();
-    char buf[224];
-    int n = snprintf(buf, sizeof(buf), "view %d\nscreen %d\naudio %s\nsubtitles %s\nstart %s\nsheets %s\nscanlines %s\nlogs %s\nskipclips %s\n",
-                     s->lib_view, s->screen, s->audio, s->subs, s->start_disc ? "disc" : "movie", s->info_sheets ? "on" : "off",
+    char buf[240];
+    int n = snprintf(buf, sizeof(buf), "view %d\ntab %s\nscreen %d\naudio %s\nsubtitles %s\nstart %s\nsheets %s\nscanlines %s\nlogs %s\nskipclips %s\n",
+                     s->lib_view, s->lib_tab ? "tv" : "movies", s->screen, s->audio, s->subs, s->start_disc ? "disc" : "movie", s->info_sheets ? "on" : "off",
                      s->scanlines ? "on" : "off", s->logs ? "on" : "off", s->skip_clips ? "on" : "off");
 
     if (plat_data_save(FILE_NAME, buf, n) < 0)

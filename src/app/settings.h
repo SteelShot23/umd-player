@@ -13,7 +13,8 @@ enum { LIB_LIST, LIB_POSTERS, LIB_DETAILS, LIB_SHELF, LIB_VIEWS };
 
 typedef struct app_settings {
     int lib_view;             /* LIB_LIST, LIB_POSTERS, LIB_DETAILS or LIB_SHELF */
-    int screen;               /* screen_mode */
+    int lib_tab;              /* the library's list: 0 movies, 1 TV shows */
+    int screen;              /* screen_mode */
     char audio[3];            /* ISO 639-1 language of the preferred audio track */
     char subs[4];             /* SUBS_OFF, SUBS_SYSTEM, or an ISO 639-1 language */
     int start_disc;           /* 1: play the disc's intros before the movie; 0: the movie only */

@@ -45,7 +45,7 @@
 #define SETTLE_US      150000          /* a selection shows its media once it rests this long */
 #define STICK_DEAD     40              /* left stick travel (of 127) that does nothing */
 #define STICK_SLOW     3.0f            /* discs a second just past the dead zone */
-#define STICK_FAST     25.0f           /* and with the stick pushed all the way */
+#define STICK_FAST     20.0f           /* and with the stick pushed all the way: a disc every third frame */
 #define HOLD_DELAY     350000          /* Up or Down held this long starts repeating */
 #define HOLD_SLOW      6.0f            /* discs a second as it starts */
 #define HOLD_RAMP      2.0f            /* seconds to reach STICK_FAST */
@@ -71,6 +71,10 @@
 #define LIST_W         574             /* stops short of the alphabet strip */
 #define LIST_ROW       28
 #define LIST_ROWS      14
+#define LIST_MARGIN    3               /* rows kept above and below the selection as the list moves */
+/* The tabs over the list: Movies and TV Shows. */
+#define TAB_Y          24
+#define TAB_H          28
 #define TITLE_Y        (BIG_Y + 2 * ICON_H + 4)   /* the selected title in the poster view */
 #define NEIGHBOUR_X    (SMALL_X + ICON_W + 16)    /* the other discs' titles, beside their icons */
 #define NEIGHBOUR_W    236
@@ -86,6 +90,8 @@
 #define SHELF_STEP     135
 #define SHELF_TILES    5
 #define SHELF_DRAG     110             /* finger travel per disc when swiping the row */
+#define SHELF_SPEED    16.0f           /* how fast the row catches up with the selection, per second */
+#define SHELF_LAG      2.0f            /* and how many discs it may fall behind */
 /* A poster is ux0:data/umdplayer/posters/<the image's name>.png. Every disc keeps one in memory
    at the row's size; the worker makes the big one when a disc is selected or near it. Each is
    exactly the size it is drawn at, as the Vita draws sprites with the nearest texel. */
@@ -167,6 +173,14 @@ struct library {
     char dirs[512];                  /* the folders to list, separated by ';' */
     lib_disc *discs;                 /* every disc found; the first count are read and shown */
     int count, sel;
+    /* Two lists in discs: tab 0 is discs 0 to split - 1, tab 1 the rest. The saved tab comes first,
+       so the scan fills the list on screen first. */
+    int split, tab, tab_sel[2], tab_tap;
+    int list_top;                    /* the list view's top row */
+    uint64_t front_draw_us;          /* the last redraw of the front layer, for the log */
+    float shelf_pos;                 /* the disc the shelf's row is at, gliding towards sel */
+    uint64_t shelf_us;
+    int bg_pin;                      /* disc whose background stays on screen while scrolling, or -1 */
     /* The scan thread reads the discs in list order; scan_read of scan_total are done (under
        cache_lock), and library_update shows them as they come. */
     plat_thread *scanner;
@@ -215,7 +229,7 @@ struct library {
     /* Where the GPU draws (plat_draws_sprites): the pictures as sprites, the background first
        and under the icon video, and the text, panels and icon corners on the transparent ui
        layer, redrawn only when what it shows changes (front_key). */
-    plat_sprite sprites[8];
+    plat_sprite sprites[10];
     uint32_t bg_id, pic0_id;
     unsigned char front_key[2048];
     uint8_t *front_prev;             /* the front layer as last handed over, for its changed rows */
@@ -586,6 +600,25 @@ static void load_details(lib_disc *disc)
     disc->details = info;
 }
 
+/* A TV show, going by the details the poster script saved. Anything else is listed as a movie. */
+static int disc_is_tv(const lib_disc *d)
+{
+    const char *facts = d->details ? d->details->facts : "";
+
+    return strstr(facts, " season") != NULL || strstr(facts, "TV series") != NULL;
+}
+
+static int tv_sorted_first;
+
+static int compare_sections(const void *a, const void *b)
+{
+    int ta = disc_is_tv(a), tb = disc_is_tv(b);
+
+    if (ta != tb)
+        return tv_sorted_first ? tb - ta : ta - tb;
+    return compare_discs(a, b);
+}
+
 static void read_disc_info(lib_disc *disc)
 {
     disc_file d;
@@ -595,7 +628,6 @@ static void read_disc_info(lib_disc *disc)
     if (strlen(disc->title) > 4 && disc->title[strlen(disc->title) - 4] == '.')
         disc->title[strlen(disc->title) - 4] = 0;   /* the file name, without .iso */
     load_poster(disc);
-    load_details(disc);
     if (disc_open(&d, disc->path) < 0)
         return;
     if ((buf = disc_read(&d, "UMD_VIDEO/PARAM.SFO", &size, 64 * 1024)) != NULL) {
@@ -985,7 +1017,7 @@ static void worker_main(void *user)
                     slot = i;
                     break;
                 }
-                if (m->state == MEDIA_READY && m->disc != l->loaded && !near &&
+                if (m->state == MEDIA_READY && m->disc != l->loaded && m->disc != l->bg_pin && !near &&
                     (slot < 0 || m->used < l->cache[slot].used))
                     slot = i;
             }
@@ -1058,14 +1090,58 @@ static int shelf_on(void)
     return settings_get()->lib_view == LIB_SHELF || details_open;
 }
 
-/* The disc in the list view's top row, so the selected one stays near the middle. */
-static int list_first(const library *l)
+/* The discs of the tab on screen that have been read: tab_lo to tab_hi - 1. */
+static int tab_lo(const library *l)
 {
-    int first = l->sel - LIST_ROWS / 2;
+    return l->tab ? l->split : 0;
+}
 
-    if (first > l->count - LIST_ROWS)
-        first = l->count - LIST_ROWS;
-    return first < 0 ? 0 : first;
+static int tab_hi(const library *l)
+{
+    return l->tab || l->count < l->split ? l->count : l->split;
+}
+
+/* The disc in the list view's top row. The list stays put while the selection moves inside it,
+   so only two rows change, and moves when the selection nears its top or bottom. */
+static int list_first(library *l)
+{
+    int lo = tab_lo(l), hi = tab_hi(l), top = l->list_top;
+
+    if (l->sel < top + LIST_MARGIN)
+        top = l->sel - LIST_MARGIN;
+    if (l->sel >= top + LIST_ROWS - LIST_MARGIN)
+        top = l->sel - LIST_ROWS + LIST_MARGIN + 1;
+    if (top > hi - LIST_ROWS)
+        top = hi - LIST_ROWS;
+    if (top < lo)
+        top = lo;
+    l->list_top = top;
+    return top;
+}
+
+/* 1 while the shelf's row is still gliding to the selection. */
+static int shelf_moving(const library *l)
+{
+    float d = (float)l->sel - l->shelf_pos;
+
+    return shelf_on() && !details_open && (d > 0.02f || d < -0.02f);
+}
+
+/* A tab's name and place over the list. Returns 0 if it has no discs. */
+static int tab_label(const library *l, int t, char *out, size_t size, int *x, int *w)
+{
+    int n = t ? l->scan_total - l->split : l->split;
+
+    snprintf(out, size, "%s  %d", (t == 0) == tv_sorted_first ? "TV Shows" : "Movies", n);
+    *w = canvas_text_width(out, 2) + 24;
+    *x = shelf_on() ? SHELF_X - 6 : LIST_X - 6;
+    if (t) {
+        char first[32];
+        int fx, fw;
+        if (tab_label(l, 0, first, sizeof(first), &fx, &fw))
+            *x = fx + fw + 8;
+    }
+    return n > 0;
 }
 
 /* As much of s as fits in max_w pixels, ending with "..." when it was cut. out holds at least
@@ -1228,13 +1304,16 @@ static void clear_media(library *l)
 {
     drop_frames(l);
     l->icon = NULL;
-    l->bg = NULL;
     l->pic0 = NULL;
     l->big_poster = NULL;
     plat_mutex_lock(l->lock);
     l->snd = NULL;
     plat_mutex_unlock(l->lock);
+    /* The background stays until the next disc's is ready, instead of flashing to the backdrop
+       on every step: the worker keeps this entry meanwhile. */
     plat_mutex_lock(l->cache_lock);
+    if (l->bg && l->loaded >= 0)
+        l->bg_pin = l->loaded;
     l->loaded = -1;
     plat_mutex_unlock(l->cache_lock);
 }
@@ -1243,6 +1322,10 @@ static void clear_media(library *l)
 static void release_devices(library *l)
 {
     clear_media(l);
+    l->bg = NULL;
+    plat_mutex_lock(l->cache_lock);
+    l->bg_pin = -1;
+    plat_mutex_unlock(l->cache_lock);
     if (l->video) {
         plat_video_close(l->video);
         l->video = NULL;
@@ -1268,6 +1351,7 @@ static int load_media(library *l)
         return 0;
     }
     l->loaded = l->sel;              /* from now on the worker keeps this entry */
+    l->bg_pin = -1;
     m->used = ++l->use_clock;
     plat_mutex_unlock(l->cache_lock);
 
@@ -1463,7 +1547,7 @@ static void draw_settings(library *l)
 /* "UMD Player" at the top left, with "by xesf - v0.6.8" below it in small text. */
 static void draw_app_name(canvas *c, int y)
 {
-    canvas_text(c, 20, y, 2, RGBA(255, 255, 255, 220), "UMD Player");
+    canvas_text(c, 20, y, 2, RGBA(255, 255, 255, 220), "UMD Player+");
     canvas_text(c, 20, y + 22, 1, TEXT_DIM, "by xesf - v" UMDPLAYER_VERSION);
 }
 
@@ -1505,7 +1589,7 @@ static void draw_titles(library *l)
     }
     for (int k = -1; k <= 2; k++) {
         int i = l->sel + k, y = k < 0 ? BIG_Y - 100 : BIG_Y + 2 * ICON_H + 20 + (k - 1) * 90, w;
-        if (k == 0 || i < 0 || i >= l->count)
+        if (k == 0 || i < tab_lo(l) || i >= tab_hi(l))
             continue;
         fit_title(t, sizeof(t), l->discs[i].title, 1, NEIGHBOUR_W);
         w = canvas_text_width(t, 1);
@@ -1639,6 +1723,27 @@ static void draw_details(library *l)
                 "This product uses the TMDB API but is not endorsed or certified by TMDB.");
 }
 
+/* The tabs over the list, and how to change them. */
+static void draw_tabs(library *l)
+{
+    canvas *c = &l->ui;
+    char s[32];
+    int x = 0, w = 0, shown = 0;
+
+    for (int t = 0; t < 2; t++) {
+        if (!tab_label(l, t, s, sizeof(s), &x, &w))
+            continue;
+        if (t == l->tab)
+            canvas_round_rect(c, x, TAB_Y, w, TAB_H, 8, RGBA(55, 95, 180, 255));
+        else
+            canvas_round_darken(c, x, TAB_Y, w, TAB_H, 8, 120);
+        canvas_text(c, x + 12, TAB_Y + 6, 2, t == l->tab ? RGBA(255, 255, 255, 255) : TEXT_DIM, s);
+        shown++;
+    }
+    if (shown > 1)
+        canvas_text(c, x + w + 12, TAB_Y + 10, 1, TEXT_DIM, shelf_on() ? "Up/Down: switch" : "Left/Right: switch");
+}
+
 /* The shelf view's text: the selected disc's title, facts and status over the row, a caption under
    each disc in the row with a dot on a disc with a saved position, and the start of the
    description below. The pictures are sprites. */
@@ -1661,12 +1766,14 @@ static void draw_shelf(library *l)
     disc_status(d, line, sizeof(line));
     if (line[0])
         canvas_text(c, SHELF_X + 4, top + 58, 1, d->no_movie || d->incomplete ? RGBA(255, 120, 100, 255) : TEXT_DIM, line);
+    if (shelf_moving(l))                     /* captions wait until the row rests */
+        return;
     if (d->details && d->details->about[0]) {
         canvas_round_darken(c, SHELF_X - 6, SHELF_Y + SHELF_H + 23, SHELF_TILES * SHELF_STEP, 46, 8, 90);
         draw_wrapped(c, SHELF_X + 4, SHELF_Y + SHELF_H + 29, 1, RGBA(255, 255, 255, 255), d->details->about,
                      SHELF_TILES * SHELF_STEP - 24, 0, 3, 12);
     }
-    for (int k = 1; k <= SHELF_TILES && l->sel + k < l->count; k++) {
+    for (int k = 1; k <= SHELF_TILES && l->sel + k < tab_hi(l); k++) {
         const lib_disc *e = &l->discs[l->sel + k];
         int x = SHELF_X + (k - 1) * SHELF_STEP, w;
         fit_title(t, sizeof(t), e->title, 1, SHELF_W);
@@ -1688,7 +1795,7 @@ static void draw_list(library *l)
     int first = list_first(l), lines, y = BIG_Y + 2 * ICON_H + 8;
 
     canvas_round_darken(c, LIST_X - 6, LIST_Y - 6, LIST_W + 12, LIST_ROWS * LIST_ROW + 12, 12, 90);
-    for (int r = 0; r < LIST_ROWS && first + r < l->count; r++) {
+    for (int r = 0; r < LIST_ROWS && first + r < tab_hi(l); r++) {
         int i = first + r, ry = LIST_Y + r * LIST_ROW;
         const lib_disc *e = &l->discs[i];
         fit_title(t, sizeof(t), e->title, 2, LIST_W - 40);
@@ -1742,6 +1849,8 @@ static void draw_front(library *l)
     draw_info(l);
     draw_settings(l);
     if (!l->settings_open) {
+        if (!details_open)
+            draw_tabs(l);
         if (details_open)
             draw_details(l);
         else if (list_on())
@@ -1756,11 +1865,11 @@ static void draw_front(library *l)
         }
     }
     /* On the backdrop (a disc without PIC1), keep clear of its film strips. */
-    draw_app_name(c, l->bg ? 18 : 72);
+    draw_app_name(c, 72);
     if (!l->settings_open)
-        draw_hints(c, l->bg ? UI_H - 18 : UI_H - 72);
+        draw_hints(c, UI_H - 72);
     if (l->notice[0] && !l->settings_open) {
-        int y = (l->bg ? UI_H - 18 : UI_H - 72) - 30 - (l->scanning || l->sheet_shown >= 0 ? 34 : 0);
+        int y = UI_H - 72 - 30 - (l->scanning || l->sheet_shown >= 0 ? 34 : 0);
         int w = canvas_text_width(l->notice, 1);
         canvas_round_darken(c, UI_W - 28 - w, y - 6, w + 16, 22, 6, 160);
         canvas_text(c, UI_W - 20 - w, y, 1, RGBA(255, 120, 100, 255), l->notice);
@@ -1769,7 +1878,7 @@ static void draw_front(library *l)
         /* above the hints: discs still being read or sheets being written, with a bar under
            the count */
         char line[48];
-        int y = (l->bg ? UI_H - 18 : UI_H - 72) - 30, w, fill;
+        int y = UI_H - 72 - 30, w, fill;
         if (l->scanning) {
             snprintf(line, sizeof(line), "Reading movies %d of %d", l->count, l->scan_total);
             fill = l->scan_total ? l->count * 1000 / l->scan_total : 0;
@@ -1852,6 +1961,29 @@ static void blit_art(library *l, const lib_disc *d, int x, int y, int w, int h)
         draw_no_icon(c, x, y + (h - ih) / 2, w, ih);
 }
 
+/* The shelf's row at shelf_pos, on whole pixels so that each poster stays sharp. A poster sliding
+   towards the big one is cut at the row's left edge. */
+static void add_shelf_row(library *l)
+{
+    int hi = tab_hi(l), lo = tab_lo(l);
+
+    for (int i = (int)l->shelf_pos; i < hi; i++) {
+        float place = (float)SHELF_X + ((float)i - 1.0f - l->shelf_pos) * SHELF_STEP;
+        int x = (int)(place + 0.5f), before = l->info.ui_sprite_count;
+
+        if (x >= UI_W || before >= (int)(sizeof(l->sprites) / sizeof(l->sprites[0])))
+            break;
+        if (i < lo || x + SHELF_W <= SHELF_X)
+            continue;
+        add_art(l, &l->discs[i], x, SHELF_Y, SHELF_W, SHELF_H);
+        if (x < SHELF_X && l->info.ui_sprite_count > before) {
+            plat_sprite *s = &l->sprites[before];
+            s->x[0] = s->x[2] = (float)SHELF_X;
+            s->u0 = (float)(SHELF_X - x) / SHELF_W;
+        }
+    }
+}
+
 /* What draw_front shows depends on: a copy of each, compared to redraw only on a change. */
 static void front_key(library *l, unsigned char *key, size_t size)
 {
@@ -1859,7 +1991,7 @@ static void front_key(library *l, unsigned char *key, size_t size)
         const void *bg;
         int show_info, bare, settings_open, settings_row, keys, scanning, count, scan_total;
         int sheet_shown, sheet_done, sheet_total, letter_shown, strip_shown, sel;
-        int details_open, details_scroll;
+        int details_open, details_scroll, tab, moving;
         unsigned notice_seq;
         app_settings settings;
         const lib_disc *disc;
@@ -1870,9 +2002,9 @@ static void front_key(library *l, unsigned char *key, size_t size)
 
     (void)sizeof(fits);
     memset(&k, 0, sizeof(k));
-    k.bg = l->bg;
+    k.bg = shelf_on() ? NULL : l->bg;   /* the shelf's text does not depend on the background */
     k.show_info = l->show_info;
-    k.bare = !d->icon0 && !l->icon && !l->pic0 && !l->settings_open;
+    k.bare = !d->icon0 && !l->icon && !l->pic0 && !l->settings_open && !shelf_on();
     k.settings_open = l->settings_open;
     k.settings_row = l->settings_row;
     k.keys = plat_keyboard_ui();
@@ -1889,6 +2021,8 @@ static void front_key(library *l, unsigned char *key, size_t size)
     k.sel = l->sel;                   /* the titles on screen follow the selection in every view */
     k.details_open = details_open;
     k.details_scroll = l->details_scroll;
+    k.tab = l->tab;
+    k.moving = shelf_moving(l);
     if (l->count > 0) {
         k.disc = d;
         k.shown = *d;
@@ -1924,7 +2058,7 @@ static void draw_ui_sprites(library *l)
     }
     for (int k = -1; k <= 2; k++) {
         int i = l->sel + k, y = k < 0 ? BIG_Y - 100 : BIG_Y + 2 * ICON_H + 20 + (k - 1) * 90;
-        if (k != 0 && i >= 0 && i < l->count && !list_on() && !shelf_on())
+        if (k != 0 && i >= tab_lo(l) && i < tab_hi(l) && !list_on() && !shelf_on())
             add_icon(l, &l->discs[i], SMALL_X, y, ICON_W, ICON_H);
     }
     if (shelf_on()) {
@@ -1932,8 +2066,9 @@ static void draw_ui_sprites(library *l)
             add_sprite(l, l->big_poster, SHELF_BIG_W, SHELF_BIG_H, l->big_poster_id, SHELF_BIG_X, SHELF_BIG_Y, SHELF_BIG_W, SHELF_BIG_H);
         else
             add_art(l, &l->discs[l->sel], SHELF_BIG_X, SHELF_BIG_Y, SHELF_BIG_W, SHELF_BIG_H);
-        for (int k = 1; !details_open && k <= SHELF_TILES && l->sel + k < l->count; k++)
-            add_art(l, &l->discs[l->sel + k], SHELF_X + (k - 1) * SHELF_STEP, SHELF_Y, SHELF_W, SHELF_H);
+        if (!details_open)
+            add_shelf_row(l);
+
     } else if (!l->icon || !l->shown) {
         add_icon(l, &l->discs[l->sel], BIG_X, BIG_Y, 2 * ICON_W, 2 * ICON_H);
     }
@@ -1942,9 +2077,11 @@ static void draw_ui_sprites(library *l)
     if (memcmp(key, l->front_key, sizeof(key)) != 0 || !l->info.ui_rgba) {
         size_t row = (size_t)l->ui.stride;
         int from = 0, to = 0;
+        uint64_t front_t0 = plat_time_us();
         memcpy(l->front_key, key, sizeof(key));
         memset(l->ui.rgba, 0, row * l->ui.h);
         draw_front(l);
+        l->front_draw_us = plat_time_us() - front_t0;
         /* the rows that changed since the last version handed over */
         if (!l->front_prev)
             l->front_prev = calloc(row, (size_t)l->ui.h);
@@ -1997,7 +2134,7 @@ static void draw_ui(library *l)
     for (int k = -1; k <= 2; k++) {
         int i = l->sel + k, y = k < 0 ? BIG_Y - 100 : BIG_Y + 2 * ICON_H + 20 + (k - 1) * 90;
         const lib_disc *d;
-        if (k == 0 || i < 0 || i >= l->count || list_on() || shelf_on())
+        if (k == 0 || i < tab_lo(l) || i >= tab_hi(l) || list_on() || shelf_on())
             continue;
         d = &l->discs[i];
         if (d->icon0)
@@ -2013,7 +2150,7 @@ static void draw_ui(library *l)
             canvas_blit(c, l->big_poster, SHELF_BIG_W, SHELF_BIG_H, SHELF_BIG_W * 4, SHELF_BIG_X, SHELF_BIG_Y, SHELF_BIG_W, SHELF_BIG_H);
         else
             blit_art(l, &l->discs[l->sel], SHELF_BIG_X, SHELF_BIG_Y, SHELF_BIG_W, SHELF_BIG_H);
-        for (int k = 1; !details_open && k <= SHELF_TILES && l->sel + k < l->count; k++)
+        for (int k = 1; !details_open && k <= SHELF_TILES && l->sel + k < tab_hi(l); k++)
             blit_art(l, &l->discs[l->sel + k], SHELF_X + (k - 1) * SHELF_STEP, SHELF_Y, SHELF_W, SHELF_H);
     } else if (l->icon) {
         canvas_round_rect(c, BIG_X, BIG_Y, 2 * ICON_W, 2 * ICON_H, BIG_R, RGBA(0, 0, 0, 0));
@@ -2254,6 +2391,7 @@ static void sheets_update(library *l)
 static void start_scan(library *l)
 {
     list_ctx ctx;
+    int tv;
 
     memset(&ctx, 0, sizeof(ctx));
     for (const char *p = l->dirs; *p;) {
@@ -2270,13 +2408,26 @@ static void start_scan(library *l)
         }
         p += n + (p[n] == ';');
     }
+    /* Movies and TV shows are told apart by their details, so those are read before the sort. */
+    tv = 0;
+    for (int i = 0; i < ctx.count; i++) {
+        load_details(&ctx.discs[i]);
+        tv += disc_is_tv(&ctx.discs[i]);
+    }
+    tv_sorted_first = tv > 0 && (settings_get()->lib_tab == 1 || tv == ctx.count);
     if (ctx.count)
-        qsort(ctx.discs, (size_t)ctx.count, sizeof(ctx.discs[0]), compare_discs);
+        qsort(ctx.discs, (size_t)ctx.count, sizeof(ctx.discs[0]), compare_sections);
     plat_mutex_lock(l->cache_lock);
     free(l->discs);
     l->discs = ctx.discs;
     l->count = 0;
     l->sel = 0;
+    l->split = tv_sorted_first ? tv : ctx.count - tv;
+    l->tab = 0;
+    l->tab_sel[0] = 0;
+    l->tab_sel[1] = l->split;
+    l->list_top = 0;
+    l->shelf_pos = 0;
     l->scan_total = ctx.count;
     l->scan_read = 0;
     l->scan_quit = 0;
@@ -2323,6 +2474,8 @@ library *library_open(const char *dir)
         return NULL;
     snprintf(l->dirs, sizeof(l->dirs), "%s", dir);
     l->strip_target = -1;
+    l->tab_tap = -1;
+    l->bg_pin = -1;
     l->lock = plat_mutex_create();
     l->at3p = malloc(at3p_decoder_size());
     l->ui.w = UI_W;
@@ -2488,6 +2641,15 @@ static uint32_t touch_buttons(library *l)
         return 0;
     x = l->touch_x0;
     y = l->touch_y0;
+    if (!details_open && y >= TAB_Y && y < TAB_Y + TAB_H) {   /* a tab: library_update changes to it */
+        for (int t = 0; t < 2; t++) {
+            char s[32];
+            int tx, tw;
+            if (tab_label(l, t, s, sizeof(s), &tx, &tw) && x >= tx && x < tx + tw)
+                l->tab_tap = t;
+        }
+        return 0;
+    }
     if (details_open) {                          /* the poster plays; a tap elsewhere goes back */
         if (x >= SHELF_BIG_X && x < SHELF_BIG_X + SHELF_BIG_W && y >= SHELF_BIG_Y && y < SHELF_BIG_Y + SHELF_BIG_H)
             return PLAT_BTN_CROSS;
@@ -2500,7 +2662,7 @@ static uint32_t touch_buttons(library *l)
             return 0;
         for (int k = 1; k <= SHELF_TILES; k++) {
             int left = SHELF_X + (k - 1) * SHELF_STEP;
-            if (x >= left && x < left + SHELF_W && l->sel + k < l->count) {
+            if (x >= left && x < left + SHELF_W && l->sel + k < tab_hi(l)) {
                 l->sel += k - 1;                 /* the Down below makes it k */
                 return PLAT_BTN_DOWN;
             }
@@ -2514,7 +2676,7 @@ static uint32_t touch_buttons(library *l)
         if (x < LIST_X || x >= LIST_X + LIST_W || y < LIST_Y || y >= LIST_Y + LIST_ROWS * LIST_ROW)
             return 0;
         i = list_first(l) + (y - LIST_Y) / LIST_ROW;
-        if (i >= l->count)
+        if (i >= tab_hi(l))
             return 0;
         if (i == l->sel)
             return PLAT_BTN_CROSS;
@@ -2527,7 +2689,7 @@ static uint32_t touch_buttons(library *l)
         return PLAT_BTN_UP;
     for (int k = 1; k <= 2; k++) {               /* the discs below, as draw_ui places them */
         int top = BIG_Y + 2 * ICON_H + 20 + (k - 1) * 90;
-        if (y >= top && y < top + ICON_H && l->sel + k < l->count) {
+        if (y >= top && y < top + ICON_H && l->sel + k < tab_hi(l)) {
             l->sel += k - 1;                     /* the Down below makes it k */
             return PLAT_BTN_DOWN;
         }
@@ -2629,7 +2791,7 @@ static int letter_jump(library *l, uint32_t pressed)
     uint32_t held = plat_buttons() & (PLAT_BTN_L | PLAT_BTN_R);
     uint64_t now = plat_time_us();
     uint32_t dir = 0;
-    int i = l->sel;
+    int i = l->sel, lo = tab_lo(l), hi = tab_hi(l);
 
     if (pressed & (PLAT_BTN_L | PLAT_BTN_R)) {
         dir = pressed & PLAT_BTN_R ? PLAT_BTN_R : PLAT_BTN_L;
@@ -2645,17 +2807,17 @@ static int letter_jump(library *l, uint32_t pressed)
         return l->sel;
     if (dir == PLAT_BTN_R) {
         char at = disc_letter(&l->discs[i]);
-        while (i < l->count - 1 && disc_letter(&l->discs[i]) == at)
+        while (i < hi - 1 && disc_letter(&l->discs[i]) == at)
             i++;
     } else {
-        if (i > 0 && disc_letter(&l->discs[i - 1]) == disc_letter(&l->discs[i])) {
+        if (i > lo && disc_letter(&l->discs[i - 1]) == disc_letter(&l->discs[i])) {
             char at = disc_letter(&l->discs[i]);
-            while (i > 0 && disc_letter(&l->discs[i - 1]) == at)
+            while (i > lo && disc_letter(&l->discs[i - 1]) == at)
                 i--;
-        } else if (i > 0) {
+        } else if (i > lo) {
             char at = disc_letter(&l->discs[i - 1]);
             i--;
-            while (i > 0 && disc_letter(&l->discs[i - 1]) == at)
+            while (i > lo && disc_letter(&l->discs[i - 1]) == at)
                 i--;
         }
     }
@@ -2683,7 +2845,7 @@ static int disc_letters(const library *l, char *letters, int *first)
 {
     int n = 0;
 
-    for (int i = 0; i < l->count; i++) {
+    for (int i = tab_lo(l); i < tab_hi(l); i++) {
         char c = disc_letter(&l->discs[i]);
         if (n == 0 || letters[n - 1] != c) {
             letters[n] = c;
@@ -2736,6 +2898,29 @@ void library_notice(library *l, const char *text)
     l->ui_dirty = 1;
 }
 
+/* Changes between Movies and TV Shows, back to where that list was left. */
+static void switch_tab(library *l)
+{
+    int other = !l->tab, lo = other ? l->split : 0, hi = other || l->count < l->split ? l->count : l->split;
+    app_settings *s = settings_get();
+
+    if (hi <= lo) {
+        library_notice(l, l->scanning ? "Still reading those discs" : "No discs in that list");
+        return;
+    }
+    l->tab_sel[l->tab] = l->sel;
+    l->tab = other;
+    l->sel = l->tab_sel[other] >= hi ? hi - 1 : l->tab_sel[other] < lo ? lo : l->tab_sel[other];
+    l->list_top = l->sel - LIST_ROWS / 2;
+    l->shelf_pos = (float)l->sel;
+    clear_media(l);
+    l->moved_us = plat_time_us();
+    l->ui_dirty = 1;
+    tell_worker(l, 0);
+    s->lib_tab = (other == 0) == tv_sorted_first;
+    settings_save();
+}
+
 int library_update(library *l, uint32_t pressed)
 {
     int present = 0;
@@ -2778,7 +2963,20 @@ int library_update(library *l, uint32_t pressed)
         load_resume_marks(l);
         l->ui_dirty = 1;
     }
-    pressed |= touch_buttons(l) | scroll_buttons(l);
+    {
+        /* Up and Down on the shelf, which scrolls with Left and Right; Left and Right elsewhere. */
+        uint32_t dpad = pressed, tab_keys = shelf_on() ? PLAT_BTN_UP | PLAT_BTN_DOWN : PLAT_BTN_LEFT | PLAT_BTN_RIGHT;
+        pressed |= touch_buttons(l) | scroll_buttons(l);
+        if (l->tab_tap >= 0) {
+            if (l->tab_tap != l->tab && !l->settings_open)
+                switch_tab(l);
+            l->tab_tap = -1;
+        }
+        if ((dpad & tab_keys) && !l->settings_open && !details_open && !l->stick_on) {
+            switch_tab(l);
+            pressed &= ~tab_keys;
+        }
+    }
     if (l->settings_open) {
         settings_input(l, pressed);
         pressed = 0;
@@ -2851,10 +3049,10 @@ int library_update(library *l, uint32_t pressed)
             to--;
         else if ((pressed & PLAT_BTN_DOWN) || (shelf_on() && (pressed & PLAT_BTN_RIGHT)))
             to++;
-        if (to > l->count - 1)
-            to = l->count - 1;
-        if (to < 0)
-            to = 0;
+        if (to > tab_hi(l) - 1)
+            to = tab_hi(l) - 1;
+        if (to < tab_lo(l))
+            to = tab_lo(l);
         pressed = to != l->sel;
         l->sel = to;
     }
@@ -2864,10 +3062,31 @@ int library_update(library *l, uint32_t pressed)
         l->moved_us = plat_time_us();
         l->details_scroll = 0;
     }
-    if (pressed || l->worker_paused)
-        tell_worker(l, 0);
-    if (pressed || !l->big_poster)
+    /* The worker rests during fast scrolling: reading each disc passed took time from the frames. */
+    {
+        int fast = l->stick_on || (l->hold_dir && plat_time_us() - l->hold_since > HOLD_DELAY);
+        if (l->worker_paused || (!fast && l->want_sel != l->sel))
+            tell_worker(l, 0);
+    }
+    if ((pressed || !l->big_poster) && l->want_sel == l->sel)
         use_big_poster(l);
+    {
+        /* The shelf's row glides to the selection; only the pictures move, so this costs little. */
+        uint64_t now = plat_time_us();
+        float d = (float)l->sel - l->shelf_pos, a = (float)(now - l->shelf_us) / 1e6f * SHELF_SPEED;
+        l->shelf_us = now;
+        if (!shelf_on() || details_open) {
+            l->shelf_pos = (float)l->sel;
+        } else if (d != 0) {
+            if (d > SHELF_LAG)
+                d = SHELF_LAG;
+            else if (d < -SHELF_LAG)
+                d = -SHELF_LAG;
+            d -= d * (a > 1 ? 1 : a);
+            l->shelf_pos = d > -0.004f && d < 0.004f ? (float)l->sel : (float)l->sel - d;
+            l->ui_dirty = 1;
+        }
+    }
     if (l->letter_shown && plat_time_us() - l->letter_us >= LETTER_SHOW && !l->strip_touch) {
         l->letter_shown = 0;
         l->ui_dirty = 1;
@@ -2913,8 +3132,8 @@ int library_update(library *l, uint32_t pressed)
     l->perf.draw += t3 - t2;
     l->perf.present += t4 - t3;
     if (t4 - t0 > 40000)
-        plat_log("perf: slow library frame %.0f ms: %.0f ms media, %.0f ms icon, %.0f ms drawing, %.0f ms present\n",
-                 (t4 - t0) / 1000.0, (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, (t3 - t2) / 1000.0, (t4 - t3) / 1000.0);
+        plat_log("perf: slow library frame %.0f ms: %.0f ms media, %.0f ms icon, %.0f ms drawing (front layer %.0f ms), %.0f ms present\n",
+                 (t4 - t0) / 1000.0, (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, (t3 - t2) / 1000.0, l->front_draw_us / 1000.0, (t4 - t3) / 1000.0);
     if (++l->perf.frames, t4 - l->perf.since >= 5000000) {
         double n = l->perf.frames;
         plat_log("perf: library %.1f frames/s, %d redraws; per frame %.1f ms media, %.1f ms icon, %.1f ms drawing, "
