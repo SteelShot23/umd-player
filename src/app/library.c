@@ -1717,11 +1717,10 @@ static void draw_settings(library *l)
     osd_draw_menu(&v, &l->ui);
 }
 
-/* "UMD Player" at the top left, with "by xesf - v0.6.8" below it in small text. */
+/* The app's name at the top left. */
 static void draw_app_name(canvas *c, int y)
 {
     canvas_text(c, 20, y, 2, RGBA(255, 255, 255, 220), "UMD Player+");
-    canvas_text(c, 20, y + 22, 1, TEXT_DIM, "by xesf - v" UMDPLAYER_VERSION);
 }
 
 /* At the bottom right: the buttons that open the settings and the manual. */
@@ -1880,8 +1879,8 @@ static void draw_details(library *l)
         y += 13;
     }
     y += 6;
-    l->details_more = draw_wrapped(c, x, y, 2, RGBA(255, 255, 255, 255), info->about, w, l->details_scroll,
-                                   (DETAILS_TEXT_END - y) / 22, 22);
+    l->details_more = draw_wrapped(c, x, y, CANVAS_SCALE_BODY, RGBA(255, 255, 255, 255), info->about, w, l->details_scroll,
+                                   (DETAILS_TEXT_END - y) / 21, 21);
     if (l->details_more || l->details_scroll > 0) {
         snprintf(line, sizeof(line), "Up/Down: more");
         canvas_text(c, UI_W - 24 - canvas_text_width(line, 1), DETAILS_TEXT_END + 2, 1, RGBA(120, 190, 255, 255), line);
@@ -1942,10 +1941,10 @@ static void draw_shelf(library *l)
 
     canvas_round_darken(c, SHELF_X - 6, SHELF_BIG_Y, SHELF_TILES * SHELF_STEP, SHELF_Y - SHELF_BIG_Y - 8, 10, 90);
     canvas_text(c, SHELF_X + 4, y, 2, RGBA(255, 255, 255, 255), l1);
-    y += 24;
+    y += 22;
     if (lines > 1) {
         canvas_text(c, SHELF_X + 4, y, 2, RGBA(255, 255, 255, 255), l2);
-        y += 24;
+        y += 22;
     }
     if (d->details && d->details->facts[0]) {
         fit_title(t, sizeof(t), d->details->facts, 1, SHELF_TILES * SHELF_STEP - 24);
@@ -1961,8 +1960,8 @@ static void draw_shelf(library *l)
         return;
     if (d->details && d->details->about[0]) {
         canvas_round_darken(c, SHELF_X - 6, below, SHELF_TILES * SHELF_STEP, SHELF_BIG_Y + SHELF_BIG_H - below, 10, 90);
-        draw_wrapped(c, SHELF_X + 4, below + 8, 2, RGBA(255, 255, 255, 255), d->details->about,
-                     SHELF_TILES * SHELF_STEP - 24, 0, 5, 23);
+        draw_wrapped(c, SHELF_X + 4, below + 8, CANVAS_SCALE_BODY, RGBA(255, 255, 255, 255), d->details->about,
+                     SHELF_TILES * SHELF_STEP - 24, 0, 5, 22);
     }
     for (int k = 1; k <= SHELF_TILES && l->sel + k < tab_hi(l); k++)
         if (l->discs[l->sel + k].has_resume)
