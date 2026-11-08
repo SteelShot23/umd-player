@@ -402,7 +402,9 @@ static sprite_tex *sprite_texture(const plat_sprite *s)
     return slot;
 }
 
-/* Each sprite as a tinted quad. Nearest texels, as the software drawing samples them. */
+/* Each sprite as a tinted quad. Nearest texels, as the software drawing samples them, for the
+   disc menus; smoothed for the library's own pictures (ids from 0x80000000), which changes
+   nothing at their exact size and softens the ones it stretches. */
 static void draw_sprites(const plat_sprite *list, int count, int slot)
 {
     static const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
@@ -419,8 +421,8 @@ static void draw_sprites(const plat_sprite *list, int count, int slot)
         if (!t || sceGxmTextureInitLinear(&tex, t->mem, SCE_GXM_TEXTURE_FORMAT_A8B8G8R8, (unsigned)s->w,
                                           (unsigned)s->h, 0) < 0)
             continue;
-        sceGxmTextureSetMinFilter(&tex, SCE_GXM_TEXTURE_FILTER_POINT);
-        sceGxmTextureSetMagFilter(&tex, SCE_GXM_TEXTURE_FILTER_POINT);
+        sceGxmTextureSetMinFilter(&tex, s->id >= 0x80000000u ? SCE_GXM_TEXTURE_FILTER_LINEAR : SCE_GXM_TEXTURE_FILTER_POINT);
+        sceGxmTextureSetMagFilter(&tex, s->id >= 0x80000000u ? SCE_GXM_TEXTURE_FILTER_LINEAR : SCE_GXM_TEXTURE_FILTER_POINT);
         for (int j = 0; j < 4; j++)
             v[j] = (vertex){s->x[j] * 2.0f / SCREEN_W - 1, 1 - s->y[j] * 2.0f / SCREEN_H, 0.5f, j & 1 ? s->u1 : s->u0,
                             j & 2 ? s->v1 : s->v0};
