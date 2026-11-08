@@ -79,12 +79,12 @@
 #define NEIGHBOUR_X    (SMALL_X + ICON_W + 16)    /* the other discs' titles, beside their icons */
 #define NEIGHBOUR_W    236
 /* The shelf view: the selected disc's poster at the left, the next discs in a row beside it. */
-#define SHELF_BIG_X    20
-#define SHELF_BIG_Y    100
-#define SHELF_BIG_W    205
-#define SHELF_BIG_H    352
-#define SHELF_X        245
-#define SHELF_Y        170
+#define SHELF_BIG_X    16
+#define SHELF_BIG_Y    66
+#define SHELF_BIG_W    256
+#define SHELF_BIG_H    440
+#define SHELF_X        288
+#define SHELF_Y        156
 #define SHELF_W        125
 #define SHELF_H        215
 #define SHELF_STEP     135
@@ -101,7 +101,7 @@
 /* Details are ux0:data/umdplayer/info/<the image's name>.txt, "key value" lines from the poster
    script. Circle shows them on a page beside the poster. */
 #define DETAILS_FILE_MAX 8192
-#define DETAILS_TEXT_END 392           /* the description stops here, above the credits */
+#define DETAILS_TEXT_END 428           /* the description stops here, above the credits */
 
 typedef struct lib_details {
     char name[96];                   /* the title on TMDb */
@@ -120,7 +120,8 @@ typedef struct lib_disc {
     int icon_w, icon_h;
     uint8_t *poster;                 /* RGBA, POSTER_W x POSTER_H, or NULL */
     uint32_t poster_id;              /* poster's id for the GPU (plat_sprite), 0 until drawn */
-    lib_details *details;            /* or NULL */
+    lib_details *details;            /* or NULL; a show shares its first disc's */
+    int group_lo, group_n;           /* a TV show of several discs: these discs, listed apart */
     int has_resume;                 /* a saved position past the start, or a saved disc state */
     int resume_disc;                 /* played through its menus: has_resume is the disc state */
     int interactive;                 /* UMD-PG: an interactive movie, played through its menus */
@@ -176,6 +177,8 @@ struct library {
     /* Two lists in discs: tab 0 is discs 0 to split - 1, tab 1 the rest. The saved tab comes first,
        so the scan fills the list on screen first. */
     int split, tab, tab_sel[2], tab_tap;
+    int tab_end[2];                  /* where each tab's list ends: TV shows' discs lie after them */
+    int group_lo, group_hi, group_parent;   /* the show open, and its entry in the list */
     int list_top;                    /* the list view's top row */
     uint64_t front_draw_us;          /* the last redraw of the front layer, for the log */
     float shelf_pos;                 /* the disc the shelf's row is at, gliding towards sel */
@@ -415,10 +418,19 @@ static const char *sort_name(const char *name)
     return name;
 }
 
-/* The letter a disc is listed under: A to Z, or # for a digit or anything else. */
+/* A TV show, going by the details the poster script saved. Anything else is listed as a movie. */
+static int disc_is_tv(const lib_disc *d)
+{
+    const char *facts = d->details ? d->details->facts : "";
+
+    return strstr(facts, " season") != NULL || strstr(facts, "TV series") != NULL;
+}
+
+/* The letter a disc is listed under: A to Z, or # for a digit or anything else. A TV disc goes by
+   its show's name, as they are sorted. */
 static char disc_letter(const lib_disc *d)
 {
-    char c = (char)(*sort_name(file_name(d->path)) | 0x20);
+    char c = (char)(*sort_name(disc_is_tv(d) ? d->details->name : file_name(d->path)) | 0x20);
     return c >= 'a' && c <= 'z' ? (char)(c - 0x20) : '#';
 }
 
@@ -602,23 +614,65 @@ static void load_details(lib_disc *disc)
     disc->details = info;
 }
 
-/* A TV show, going by the details the poster script saved. Anything else is listed as a movie. */
-static int disc_is_tv(const lib_disc *d)
-{
-    const char *facts = d->details ? d->details->facts : "";
-
-    return strstr(facts, " season") != NULL || strstr(facts, "TV series") != NULL;
-}
-
 static int tv_sorted_first;
 
+/* Movies and TV shows apart, a show's discs together under its name, then in file name order. */
 static int compare_sections(const void *a, const void *b)
 {
-    int ta = disc_is_tv(a), tb = disc_is_tv(b);
+    const lib_disc *da = a, *db = b;
+    int ta = disc_is_tv(da), tb = disc_is_tv(db);
 
     if (ta != tb)
         return tv_sorted_first ? tb - ta : ta - tb;
+    if (ta) {
+        const unsigned char *na = (const unsigned char *)sort_name(da->details->name);
+        const unsigned char *nb = (const unsigned char *)sort_name(db->details->name);
+        for (; *na || *nb; na++, nb++) {
+            int ca = *na >= 'A' && *na <= 'Z' ? *na + 32 : *na, cb = *nb >= 'A' && *nb <= 'Z' ? *nb + 32 : *nb;
+            if (ca != cb)
+                return ca - cb;
+        }
+    }
     return compare_discs(a, b);
+}
+
+/* Gives each TV show of several discs one entry in the list, and moves its discs after the shows:
+   the TV discs at tv_start, tv of them, sorted, become the shows, then the discs of those with
+   several. Returns the new array (the old one is freed), or the same one if there is no memory. */
+static lib_disc *group_tv_discs(lib_disc *discs, int *count, int tv_start, int tv, int *shows_out)
+{
+    int shows = 0, groups = 0, s, p;
+    lib_disc *out;
+
+    for (int a = tv_start, b; a < tv_start + tv; a = b) {
+        for (b = a + 1; b < tv_start + tv && strcmp(discs[a].details->name, discs[b].details->name) == 0; b++)
+            ;
+        shows++;
+        groups += b - a > 1;
+    }
+    *shows_out = tv;
+    if (!tv || (out = malloc((size_t)(*count + groups) * sizeof(*out))) == NULL)
+        return discs;
+    memcpy(out, discs, (size_t)tv_start * sizeof(*out));
+    s = tv_start;
+    p = tv_start + shows;
+    for (int a = tv_start, b; a < tv_start + tv; a = b) {
+        for (b = a + 1; b < tv_start + tv && strcmp(discs[a].details->name, discs[b].details->name) == 0; b++)
+            ;
+        out[s] = discs[a];
+        if (b - a > 1) {
+            out[s].group_lo = p;
+            out[s].group_n = b - a;
+            memcpy(out + p, discs + a, (size_t)(b - a) * sizeof(*out));
+            p += b - a;
+        }
+        s++;
+    }
+    memcpy(out + p, discs + tv_start + tv, (size_t)(*count - tv_start - tv) * sizeof(*out));
+    free(discs);
+    *count += groups;
+    *shows_out = shows;
+    return out;
 }
 
 static void read_disc_info(lib_disc *disc)
@@ -1161,6 +1215,8 @@ static void load_resume_mark(lib_disc *d)
     resume_entry e;
     static char state[4096];
 
+    if (d->group_n)                  /* a show: its discs have their own marks */
+        return;
     d->resume_disc = settings_get()->start_disc || d->interactive;
     if (d->resume_disc) {
         d->has_resume = disc_state_load(file_name(d->path), state, sizeof(state)) == 0;
@@ -1181,26 +1237,30 @@ static void load_resume_marks(library *l)
 
 /* Circle's details page. It lays out like the shelf, with the poster at the left, in any view. */
 static int details_open;
+/* A TV show's page: its discs in a list beside the poster, whichever view the library is in. */
+static int group_open;
 
 static int list_on(void)
 {
-    return settings_get()->lib_view == LIB_LIST && !details_open;
+    return (settings_get()->lib_view == LIB_LIST && !details_open) || group_open;
 }
 
 static int shelf_on(void)
 {
-    return settings_get()->lib_view == LIB_SHELF || details_open;
+    return (settings_get()->lib_view == LIB_SHELF || details_open) && !group_open;
 }
 
 /* The discs of the tab on screen that have been read: tab_lo to tab_hi - 1. */
 static int tab_lo(const library *l)
 {
-    return l->tab ? l->split : 0;
+    return group_open ? l->group_lo : l->tab ? l->split : 0;
 }
 
 static int tab_hi(const library *l)
 {
-    return l->tab || l->count < l->split ? l->count : l->split;
+    int end = group_open ? l->group_hi : l->tab_end[l->tab];
+
+    return l->count < end ? l->count : end;
 }
 
 /* The disc in the list view's top row. The list stays put while the selection moves inside it,
@@ -1232,7 +1292,7 @@ static int shelf_moving(const library *l)
 /* A tab's name and place over the list. Returns 0 if it has no discs. */
 static int tab_label(const library *l, int t, char *out, size_t size, int *x, int *w)
 {
-    int n = t ? l->scan_total - l->split : l->split;
+    int n = l->tab_end[t] - (t ? l->split : 0);
 
     snprintf(out, size, "%s  %d", (t == 0) == tv_sorted_first ? "TV Shows" : "Movies", n);
     *w = canvas_text_width(out, 2) + 24;
@@ -1673,10 +1733,12 @@ static void draw_hints(canvas *c, int y)
     int mw = osd_key_width(key) + 6 + canvas_text_width("Manual", 1);
     int lw = osd_key_width(lr) + 6 + canvas_text_width("Letter", 1);
     int vw = osd_key_width(sel) + 6 + canvas_text_width("View", 1);
-    const char *more = details_open ? "Back" : "Details";
+    const char *more = details_open || group_open ? "Back" : "Details";
     int dw = osd_button_width(ICON_BUTTON_CIRCLE, 1) + 6 + canvas_text_width(more, 1);
     int x = UI_W - 20 - w;
 
+    if (shelf_on() || group_open)            /* under the poster and the description: keep it legible */
+        canvas_round_darken(c, x - 104 - mw - lw - vw - dw, y - 10, w + mw + lw + vw + dw + 116, 28, 8, 110);
     osd_draw_hint(c, x, y - 4, ICON_BUTTON_TRIANGLE, "Settings");
     osd_draw_key_hint(c, x - 24 - mw, y - 4, key, "Manual");
     osd_draw_key_hint(c, x - 48 - mw - lw, y - 4, lr, "Letter");
@@ -1779,11 +1841,11 @@ static void draw_details(library *l)
     canvas *c = &l->ui;
     const lib_disc *d = &l->discs[l->sel];
     const lib_details *info = d->details;
-    int x = SHELF_X + 4, w = UI_W - 24 - x, y = SHELF_BIG_Y;
+    int x = SHELF_X + 4, w = UI_W - 24 - x, y = SHELF_BIG_Y + 8;
     char l1[96], l2[96], line[64];
     int lines;
 
-    canvas_round_darken(c, SHELF_X - 6, SHELF_BIG_Y - 8, UI_W - SHELF_X - 8, 370, 12, 110);
+    canvas_round_darken(c, SHELF_X - 6, SHELF_BIG_Y, UI_W - SHELF_X - 8, SHELF_BIG_H, 12, 110);
     lines = wrap_title(info && info->name[0] ? info->name : d->title, l1, l2, sizeof(l1), w);
     canvas_text(c, x, y, 2, RGBA(255, 255, 255, 255), l1);
     y += 22;
@@ -1832,7 +1894,7 @@ static void draw_details(library *l)
     }
     if (info->credit2[0])
         draw_wrapped(c, x, y, 1, TEXT_DIM, info->credit2, w, 0, 2, 12);
-    canvas_text(c, x, SHELF_BIG_Y + 348, 1, RGBA(120, 130, 150, 255),
+    canvas_text(c, x, SHELF_BIG_Y + SHELF_BIG_H - 18, 1, RGBA(120, 130, 150, 255),
                 "This product uses the TMDB API but is not endorsed or certified by TMDB.");
 }
 
@@ -1843,6 +1905,16 @@ static void draw_tabs(library *l)
     char s[32];
     int x = 0, w = 0, shown = 0;
 
+    if (group_open) {
+        const lib_disc *show = &l->discs[l->group_parent];
+        char name[100];
+        fit_title(name, sizeof(name), show->title, 2, UI_W - LIST_X - 170);
+        w = canvas_text_width(name, 2) + 24;
+        canvas_round_rect(c, LIST_X - 6, TAB_Y, w, TAB_H, 8, RGBA(55, 95, 180, 255));
+        canvas_text(c, LIST_X + 6, TAB_Y + 6, 2, RGBA(255, 255, 255, 255), name);
+        canvas_text(c, LIST_X - 6 + w + 12, TAB_Y + 10, 1, TEXT_DIM, "Circle: all shows");
+        return;
+    }
     for (int t = 0; t < 2; t++) {
         if (!tab_label(l, t, s, sizeof(s), &x, &w))
             continue;
@@ -1866,36 +1938,70 @@ static void draw_shelf(library *l)
     const lib_disc *d = &l->discs[l->sel];
     char t[100], l1[96], l2[96], line[64];
     int lines = wrap_title(d->title, l1, l2, sizeof(l1), SHELF_TILES * SHELF_STEP - 24);
-    int top = SHELF_BIG_Y - 20;
+    int y = SHELF_BIG_Y + 8, below = SHELF_Y + SHELF_H + 8;
 
-    canvas_round_darken(c, SHELF_X - 6, top - 8, SHELF_TILES * SHELF_STEP, 84, 10, 90);
-    canvas_text(c, SHELF_X + 4, top, 2, RGBA(255, 255, 255, 255), l1);
-    if (lines > 1)
-        canvas_text(c, SHELF_X + 4, top + 22, 2, RGBA(255, 255, 255, 255), l2);
+    canvas_round_darken(c, SHELF_X - 6, SHELF_BIG_Y, SHELF_TILES * SHELF_STEP, SHELF_Y - SHELF_BIG_Y - 8, 10, 90);
+    canvas_text(c, SHELF_X + 4, y, 2, RGBA(255, 255, 255, 255), l1);
+    y += 24;
+    if (lines > 1) {
+        canvas_text(c, SHELF_X + 4, y, 2, RGBA(255, 255, 255, 255), l2);
+        y += 24;
+    }
     if (d->details && d->details->facts[0]) {
         fit_title(t, sizeof(t), d->details->facts, 1, SHELF_TILES * SHELF_STEP - 24);
-        canvas_text(c, SHELF_X + 4, top + 45, 1, RGBA(255, 255, 255, 255), t);
+        canvas_text(c, SHELF_X + 4, y, 1, RGBA(255, 255, 255, 255), t);
+        y += 15;
     }
     disc_status(d, line, sizeof(line));
+    if (!line[0] && d->group_n)
+        snprintf(line, sizeof(line), "%d discs: X to open", d->group_n);
     if (line[0])
-        canvas_text(c, SHELF_X + 4, top + 60, 1, d->no_movie || d->incomplete ? RGBA(255, 120, 100, 255) : TEXT_DIM, line);
-    if (shelf_moving(l))                     /* captions wait until the row rests */
+        canvas_text(c, SHELF_X + 4, y, 1, d->no_movie || d->incomplete ? RGBA(255, 120, 100, 255) : TEXT_DIM, line);
+    if (shelf_moving(l))                     /* the description waits until the row rests */
         return;
     if (d->details && d->details->about[0]) {
-        canvas_round_darken(c, SHELF_X - 6, SHELF_Y + SHELF_H + 23, SHELF_TILES * SHELF_STEP, 46, 8, 90);
-        draw_wrapped(c, SHELF_X + 4, SHELF_Y + SHELF_H + 29, 1, RGBA(255, 255, 255, 255), d->details->about,
-                     SHELF_TILES * SHELF_STEP - 24, 0, 3, 12);
+        canvas_round_darken(c, SHELF_X - 6, below, SHELF_TILES * SHELF_STEP, SHELF_BIG_Y + SHELF_BIG_H - below, 10, 90);
+        draw_wrapped(c, SHELF_X + 4, below + 8, 2, RGBA(255, 255, 255, 255), d->details->about,
+                     SHELF_TILES * SHELF_STEP - 24, 0, 5, 23);
     }
-    for (int k = 1; k <= SHELF_TILES && l->sel + k < tab_hi(l); k++) {
-        const lib_disc *e = &l->discs[l->sel + k];
-        int x = SHELF_X + (k - 1) * SHELF_STEP, w;
-        fit_title(t, sizeof(t), e->title, 1, SHELF_W);
-        w = canvas_text_width(t, 1);
-        canvas_round_darken(c, x - 2, SHELF_Y + SHELF_H + 4, w + 6, 16, 4, 110);
-        canvas_text(c, x, SHELF_Y + SHELF_H + 8, 1, RGBA(255, 255, 255, 255), t);
-        if (e->has_resume)
-            canvas_round_rect(c, x + SHELF_W - 16, SHELF_Y + 6, 10, 10, 5, RGBA(120, 190, 255, 255));
+    for (int k = 1; k <= SHELF_TILES && l->sel + k < tab_hi(l); k++)
+        if (l->discs[l->sel + k].has_resume)
+            canvas_round_rect(c, SHELF_X + (k - 1) * SHELF_STEP + SHELF_W - 16, SHELF_Y + 6, 10, 10, 5, RGBA(120, 190, 255, 255));
+}
+
+/* A disc's line on its show's page: its file name without the show's name, brackets or extension,
+   so "Prison Break - Season 1 - Disc 02 (2006).iso" reads "Season 1 - Disc 02". */
+static void disc_label(const lib_disc *d, char *out, size_t size)
+{
+    const char *s = file_name(d->path), *end = strrchr(s, '.'), *show = d->details ? d->details->name : "";
+    size_t n = 0, k = 0;
+    int depth = 0;
+    char clean[120];
+
+    if (!end)
+        end = s + strlen(s);
+    for (; s < end && n + 1 < sizeof(clean); s++) {
+        if (*s == '(' || *s == '[')
+            depth++;
+        else if ((*s == ')' || *s == ']') && depth > 0)
+            depth--;
+        else if (!depth)
+            clean[n++] = *s;
     }
+    clean[n] = 0;
+    while (n > 0 && clean[n - 1] == ' ')
+        clean[--n] = 0;
+    while (show[k] && clean[k] && (show[k] | 0x20) == (clean[k] | 0x20))
+        k++;
+    if (!show[k] && (clean[k] == ' ' || clean[k] == '-')) {
+        while (clean[k] == ' ' || clean[k] == '-')
+            k++;
+        if (clean[k]) {
+            snprintf(out, size, "%s", clean + k);
+            return;
+        }
+    }
+    snprintf(out, size, "%s", clean);
 }
 
 /* The list view: a page of titles beside the selected disc's icon, with its full title and
@@ -1907,11 +2013,16 @@ static void draw_list(library *l)
     char t[100], l1[96], l2[96], line[64];
     int first = list_first(l), lines, y = BIG_Y + 2 * ICON_H + 8;
 
-    canvas_round_darken(c, LIST_X - 6, LIST_Y - 6, LIST_W + 12, LIST_ROWS * LIST_ROW + 12, 12, 90);
+    int shown_rows = tab_hi(l) - first < LIST_ROWS ? tab_hi(l) - first : LIST_ROWS;
+
+    canvas_round_darken(c, LIST_X - 6, LIST_Y - 6, LIST_W + 12, (group_open ? shown_rows : LIST_ROWS) * LIST_ROW + 12, 12, 90);
     for (int r = 0; r < LIST_ROWS && first + r < tab_hi(l); r++) {
         int i = first + r, ry = LIST_Y + r * LIST_ROW;
         const lib_disc *e = &l->discs[i];
-        fit_title(t, sizeof(t), e->title, 2, LIST_W - 40);
+        char label[100];
+        if (group_open)
+            disc_label(e, label, sizeof(label));
+        fit_title(t, sizeof(t), group_open ? label : e->title, 2, LIST_W - 40);
         if (i == l->sel)
             canvas_round_rect(c, LIST_X, ry, LIST_W, LIST_ROW, 6, RGBA(55, 95, 180, 255));
         canvas_text(c, LIST_X + 8, ry + 6, 2, e->no_movie ? RGBA(255, 120, 100, 255) : i == l->sel ? RGBA(255, 255, 255, 255) : TEXT_DIM, t);
@@ -1919,6 +2030,15 @@ static void draw_list(library *l)
             canvas_round_rect(c, LIST_X + LIST_W - 20, ry + 9, 10, 10, 5, RGBA(120, 190, 255, 255));
     }
 
+    if (group_open) {                        /* where the selected disc stands, under the list */
+        int under = LIST_Y + shown_rows * LIST_ROW + 16;
+        disc_status(d, line, sizeof(line));
+        if (line[0])
+            canvas_text(c, LIST_X, under, 1, d->no_movie || d->incomplete ? RGBA(255, 120, 100, 255) : TEXT_DIM, line);
+        if (d->has_resume && !d->no_movie)
+            canvas_text(c, LIST_X, under + 16, 1, TEXT_DIM, "Square: from the beginning");
+        return;
+    }
     lines = wrap_title(d->title, l1, l2, sizeof(l1), 2 * ICON_W - 16);
     canvas_round_darken(c, BIG_X, y, 2 * ICON_W, 84, 10, 90);
     canvas_text(c, BIG_X + 8, y + 6, 2, RGBA(255, 255, 255, 255), l1);
@@ -1957,7 +2077,7 @@ static void draw_front(library *l)
 {
     canvas *c = &l->ui;
 
-    if (!shelf_on())
+    if (!shelf_on() && !group_open)
         fill_icon_corners(l);
     draw_info(l);
     draw_settings(l);
@@ -1974,15 +2094,16 @@ static void draw_front(library *l)
             draw_titles(l);
         if (!details_open) {
             draw_letter(l);
-            draw_strip(l);
+            if (!group_open)
+                draw_strip(l);
         }
     }
     /* On the backdrop (a disc without PIC1), keep clear of its film strips. */
-    draw_app_name(c, 72);
+    draw_app_name(c, shelf_on() || group_open ? 16 : 72);
     if (!l->settings_open)
-        draw_hints(c, UI_H - 72);
+        draw_hints(c, shelf_on() || group_open ? UI_H - 26 : UI_H - 72);
     if (l->notice[0] && !l->settings_open) {
-        int y = UI_H - 72 - 30 - (l->scanning || l->sheet_shown >= 0 ? 34 : 0);
+        int y = (shelf_on() || group_open ? UI_H - 26 : UI_H - 72) - 30 - (l->scanning || l->sheet_shown >= 0 ? 34 : 0);
         int w = canvas_text_width(l->notice, 1);
         canvas_round_darken(c, UI_W - 28 - w, y - 6, w + 16, 22, 6, 160);
         canvas_text(c, UI_W - 20 - w, y, 1, RGBA(255, 120, 100, 255), l->notice);
@@ -1991,7 +2112,7 @@ static void draw_front(library *l)
         /* above the hints: discs still being read or sheets being written, with a bar under
            the count */
         char line[48];
-        int y = UI_H - 72 - 30, w, fill;
+        int y = (shelf_on() || group_open ? UI_H - 26 : UI_H - 72) - 30, w, fill;
         if (l->scanning) {
             snprintf(line, sizeof(line), "Reading movies %d of %d", l->count, l->scan_total);
             fill = l->scan_total ? l->count * 1000 / l->scan_total : 0;
@@ -2104,7 +2225,7 @@ static void front_key(library *l, unsigned char *key, size_t size)
         const void *bg;
         int show_info, bare, settings_open, settings_row, keys, scanning, count, scan_total;
         int sheet_shown, sheet_done, sheet_total, letter_shown, strip_shown, sel;
-        int details_open, details_scroll, tab, moving;
+        int details_open, details_scroll, tab, moving, group;
         unsigned notice_seq;
         app_settings settings;
         const lib_disc *disc;
@@ -2115,9 +2236,9 @@ static void front_key(library *l, unsigned char *key, size_t size)
 
     (void)sizeof(fits);
     memset(&k, 0, sizeof(k));
-    k.bg = shelf_on() ? NULL : l->bg;   /* the shelf's text does not depend on the background */
+    k.bg = shelf_on() || group_open ? NULL : l->bg;   /* the shelf's text does not depend on the background */
     k.show_info = l->show_info;
-    k.bare = !d->icon0 && !l->icon && !l->pic0 && !l->settings_open && !shelf_on();
+    k.bare = !d->icon0 && !l->icon && !l->pic0 && !l->settings_open && !shelf_on() && !group_open;
     k.settings_open = l->settings_open;
     k.settings_row = l->settings_row;
     k.keys = plat_keyboard_ui();
@@ -2135,6 +2256,7 @@ static void front_key(library *l, unsigned char *key, size_t size)
     k.details_open = details_open;
     k.details_scroll = l->details_scroll;
     k.tab = l->tab;
+    k.group = group_open;
     k.moving = shelf_moving(l);
     if (l->count > 0) {
         k.disc = d;
@@ -2181,7 +2303,11 @@ static void draw_ui_sprites(library *l)
             add_art(l, &l->discs[l->sel], SHELF_BIG_X, SHELF_BIG_Y, SHELF_BIG_W, SHELF_BIG_H);
         if (!details_open)
             add_shelf_row(l);
-
+    } else if (group_open) {
+        if (l->big_poster)
+            add_sprite(l, l->big_poster, SHELF_BIG_W, SHELF_BIG_H, l->big_poster_id, SHELF_BIG_X, SHELF_BIG_Y, SHELF_BIG_W, SHELF_BIG_H);
+        else
+            add_art(l, &l->discs[l->sel], SHELF_BIG_X, SHELF_BIG_Y, SHELF_BIG_W, SHELF_BIG_H);
     } else if (!l->icon || !l->shown) {
         add_icon(l, &l->discs[l->sel], BIG_X, BIG_Y, 2 * ICON_W, 2 * ICON_H);
     }
@@ -2265,6 +2391,8 @@ static void draw_ui(library *l)
             blit_art(l, &l->discs[l->sel], SHELF_BIG_X, SHELF_BIG_Y, SHELF_BIG_W, SHELF_BIG_H);
         for (int k = 1; !details_open && k <= SHELF_TILES && l->sel + k < tab_hi(l); k++)
             blit_art(l, &l->discs[l->sel + k], SHELF_X + (k - 1) * SHELF_STEP, SHELF_Y, SHELF_W, SHELF_H);
+    } else if (group_open) {
+        blit_art(l, &l->discs[l->sel], SHELF_BIG_X, SHELF_BIG_Y, SHELF_BIG_W, SHELF_BIG_H);
     } else if (l->icon) {
         canvas_round_rect(c, BIG_X, BIG_Y, 2 * ICON_W, 2 * ICON_H, BIG_R, RGBA(0, 0, 0, 0));
     } else if (l->discs[l->sel].icon0) {
@@ -2399,6 +2527,8 @@ static void scan_main(void *user)
             read_disc_info(&l->discs[i]);
             save_disc_cache(&l->discs[i]);
         }
+        if (l->discs[i].group_n)          /* a show goes by its name, not its first disc's */
+            snprintf(l->discs[i].title, sizeof(l->discs[i].title), "%s", l->discs[i].details->name);
         plat_mutex_lock(l->cache_lock);
         l->scan_read = i + 1;
         plat_mutex_unlock(l->cache_lock);
@@ -2510,7 +2640,7 @@ static int rescan_next;             /* the library opened next reads every disc 
 static void start_scan(library *l)
 {
     list_ctx ctx;
-    int tv;
+    int tv, tv_start, shows = 0, listed;
 
     memset(&ctx, 0, sizeof(ctx));
     for (const char *p = l->dirs; *p;) {
@@ -2536,12 +2666,18 @@ static void start_scan(library *l)
     tv_sorted_first = tv > 0 && (settings_get()->lib_tab == 1 || tv == ctx.count);
     if (ctx.count)
         qsort(ctx.discs, (size_t)ctx.count, sizeof(ctx.discs[0]), compare_sections);
+    tv_start = tv_sorted_first ? 0 : ctx.count - tv;
+    listed = ctx.count;
+    ctx.discs = group_tv_discs(ctx.discs, &ctx.count, tv_start, tv, &shows);
+    tv += ctx.count - listed;                /* the shows' own entries count as TV */
     plat_mutex_lock(l->cache_lock);
     free(l->discs);
     l->discs = ctx.discs;
     l->count = 0;
     l->sel = 0;
     l->split = tv_sorted_first ? tv : ctx.count - tv;
+    l->tab_end[0] = tv_sorted_first ? shows : l->split;
+    l->tab_end[1] = tv_sorted_first ? ctx.count : l->split + shows;
     l->tab = 0;
     l->tab_sel[0] = 0;
     l->tab_sel[1] = l->split;
@@ -2617,6 +2753,7 @@ library *library_open(const char *dir)
     l->ui_dirty = 1;
     l->show_info = settings_get()->lib_view == LIB_DETAILS;
     details_open = 0;
+    group_open = 0;
     l->info.video_w = ICON_W;
     l->info.video_h = ICON_H;
     l->info.dst = (plat_rect){(float)BIG_X / UI_W, (float)BIG_Y / UI_H, 2.0f * ICON_W / UI_W, 2.0f * ICON_H / UI_H};
@@ -2722,7 +2859,7 @@ static uint32_t touch_buttons(library *l)
         l->touch_y0 = l->touch_step_y = y;
         l->touch_step_x = x;
         l->touch_moved = 0;
-        l->strip_touch = !l->settings_open && !details_open && x >= UI_W - STRIP_W - 16 && y >= STRIP_TOP - 20 && y < STRIP_BOTTOM + 20;
+        l->strip_touch = !l->settings_open && !details_open && !group_open && x >= UI_W - STRIP_W - 16 && y >= STRIP_TOP - 20 && y < STRIP_BOTTOM + 20;
     }
     if (down && l->strip_touch) {                /* on the alphabet strip: the letter under the finger */
         l->strip_target = strip_disc(l, y);
@@ -2762,6 +2899,8 @@ static uint32_t touch_buttons(library *l)
         return 0;
     x = l->touch_x0;
     y = l->touch_y0;
+    if (group_open && y >= TAB_Y && y < TAB_Y + TAB_H)   /* a show's name: back to the shows */
+        return PLAT_BTN_CIRCLE;
     if (!details_open && y >= TAB_Y && y < TAB_Y + TAB_H) {   /* a tab: library_update changes to it */
         for (int t = 0; t < 2; t++) {
             char s[32];
@@ -2968,7 +3107,7 @@ static int disc_letters(const library *l, char *letters, int *first)
 
     for (int i = tab_lo(l); i < tab_hi(l); i++) {
         char c = disc_letter(&l->discs[i]);
-        if (n == 0 || letters[n - 1] != c) {
+        if (n == 0 || (letters[n - 1] != c && n < 27)) {
             letters[n] = c;
             first[n++] = i;
         }
@@ -3022,7 +3161,7 @@ void library_notice(library *l, const char *text)
 /* Changes between Movies and TV Shows, back to where that list was left. */
 static void switch_tab(library *l)
 {
-    int other = !l->tab, lo = other ? l->split : 0, hi = other || l->count < l->split ? l->count : l->split;
+    int other = !l->tab, lo = other ? l->split : 0, hi = l->count < l->tab_end[other] ? l->count : l->tab_end[other];
     app_settings *s = settings_get();
 
     if (hi <= lo) {
@@ -3040,6 +3179,39 @@ static void switch_tab(library *l)
     tell_worker(l, 0);
     s->lib_tab = (other == 0) == tv_sorted_first;
     settings_save();
+}
+
+/* Opens a TV show's page: its discs in a list beside the poster. */
+static void enter_group(library *l)
+{
+    const lib_disc *show = &l->discs[l->sel];
+
+    if (l->count <= show->group_lo) {
+        library_notice(l, "Still reading those discs");
+        return;
+    }
+    l->group_parent = l->sel;
+    l->group_lo = show->group_lo;
+    l->group_hi = show->group_lo + show->group_n;
+    group_open = 1;
+    l->sel = l->group_lo;
+    l->list_top = l->group_lo;
+    clear_media(l);
+    l->moved_us = plat_time_us();
+    l->ui_dirty = 1;
+    tell_worker(l, 0);
+}
+
+static void leave_group(library *l)
+{
+    group_open = 0;
+    l->sel = l->group_parent;
+    l->list_top = l->sel - LIST_ROWS / 2;
+    l->shelf_pos = (float)l->sel;
+    clear_media(l);
+    l->moved_us = plat_time_us();
+    l->ui_dirty = 1;
+    tell_worker(l, 0);
 }
 
 int library_update(library *l, uint32_t pressed)
@@ -3093,7 +3265,7 @@ int library_update(library *l, uint32_t pressed)
                 switch_tab(l);
             l->tab_tap = -1;
         }
-        if ((dpad & tab_keys) && !l->settings_open && !details_open && !l->stick_on) {
+        if ((dpad & tab_keys) && !l->settings_open && !details_open && !group_open && !l->stick_on) {
             switch_tab(l);
             pressed &= ~tab_keys;
         }
@@ -3105,6 +3277,10 @@ int library_update(library *l, uint32_t pressed)
     if (l->rescan) {
         rescan_next = 1;
         return -3;
+    }
+    if (group_open && (pressed & (PLAT_BTN_CIRCLE | PLAT_BTN_SELECT))) {
+        leave_group(l);
+        pressed &= ~(uint32_t)(PLAT_BTN_CIRCLE | PLAT_BTN_SELECT);
     }
     if (pressed & PLAT_BTN_CIRCLE) {
         details_open = !details_open;
@@ -3133,6 +3309,10 @@ int library_update(library *l, uint32_t pressed)
         l->settings_row = 0;
         l->ui_dirty = 1;
         pressed = 0;
+    }
+    if ((pressed & PLAT_BTN_CROSS) && l->discs[l->sel].group_n) {
+        enter_group(l);
+        pressed &= ~(uint32_t)PLAT_BTN_CROSS;
     }
     if ((pressed & PLAT_BTN_CROSS) && l->discs[l->sel].no_movie) {
         library_notice(l, "No movie in this image: UMD_VIDEO/PLAYLIST.UMD is missing");
@@ -3250,7 +3430,7 @@ int library_update(library *l, uint32_t pressed)
     }
     t3 = plat_time_us();
     if (present)
-        plat_present(l->icon && !shelf_on() ? l->shown : NULL, &l->info);
+        plat_present(l->icon && !shelf_on() && !group_open ? l->shown : NULL, &l->info);
     t4 = plat_time_us();
     l->perf.media += t1 - t0;
     l->perf.icon += t2 - t1;
@@ -3312,7 +3492,8 @@ void library_close(library *l)
         free_media(&l->cache[i]);
     for (int i = 0; i < l->scan_total; i++) {
         free(l->discs[i].poster);
-        free(l->discs[i].details);
+        if (!l->discs[i].group_n)
+            free(l->discs[i].details);
         free(l->discs[i].icon0);
     }
     free(l->discs);
