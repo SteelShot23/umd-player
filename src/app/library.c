@@ -65,11 +65,40 @@
 #define TAP_MOVE       24              /* at most this much movement for a tap */
 #define TEXT_DIM  RGBA(180, 190, 210, 255)
 
+/* The list view: the selected disc's icon stays at the left, the titles go beside it. */
+#define LIST_X         322
+#define LIST_Y         62
+#define LIST_W         574             /* stops short of the alphabet strip */
+#define LIST_ROW       28
+#define LIST_ROWS      14
+#define TITLE_Y        (BIG_Y + 2 * ICON_H + 4)   /* the selected title in the poster view */
+#define NEIGHBOUR_X    (SMALL_X + ICON_W + 16)    /* the other discs' titles, beside their icons */
+#define NEIGHBOUR_W    236
+/* The shelf view: the selected disc's poster at the left, the next discs in a row beside it. */
+#define SHELF_BIG_X    20
+#define SHELF_BIG_Y    100
+#define SHELF_BIG_W    205
+#define SHELF_BIG_H    352
+#define SHELF_X        245
+#define SHELF_Y        170
+#define SHELF_W        125
+#define SHELF_H        215
+#define SHELF_STEP     135
+#define SHELF_TILES    5
+#define SHELF_DRAG     110             /* finger travel per disc when swiping the row */
+/* A poster is ux0:data/umdplayer/posters/<the image's name>.png, kept in memory at this size:
+   the shape of a UMD Video case. */
+#define POSTER_W       140
+#define POSTER_H       240
+#define POSTER_FILE_MAX (3 * 1024 * 1024)
+
 typedef struct lib_disc {
     char path[512];
     char title[96];
     uint8_t *icon0;                  /* RGBA, or NULL */
     int icon_w, icon_h;
+    uint8_t *poster;                 /* RGBA, POSTER_W x POSTER_H, or NULL */
+    uint32_t poster_id;              /* poster's id for the GPU (plat_sprite), 0 until drawn */
     int has_resume;                  /* a saved position past the start, or a saved disc state */
     int resume_disc;                 /* played through its menus: has_resume is the disc state */
     int interactive;                 /* UMD-PG: an interactive movie, played through its menus */
@@ -203,7 +232,7 @@ struct library {
     char notice[64];                 /* a message above the hints, until notice_until */
     uint64_t notice_until;
     unsigned notice_seq;
-    int touch_down, touch_x0, touch_y0, touch_step_y, touch_moved;   /* a finger on the screen */
+    int touch_down, touch_x0, touch_y0, touch_step_x, touch_step_y, touch_moved;   /* a finger on the screen */
     int scroll;                      /* mouse wheel steps not yet taken, positive down the list */
     uint64_t scroll_us;              /* when the wheel was last read */
     int settings_open, settings_row; /* △: the defaults for new discs */
@@ -436,6 +465,34 @@ static int file_end(void *user, const char *path, const iso_entry *e)
     return 0;
 }
 
+/* The disc's poster, if the data folder has one, scaled to POSTER_W x POSTER_H. */
+static void load_poster(lib_disc *disc)
+{
+    char name[240], *dot;
+    uint8_t *file, *rgba, *small;
+    int n, w = 0, h = 0;
+
+    snprintf(name, sizeof(name), "posters/%.220s", file_name(disc->path));
+    if ((dot = strrchr(name, '.')) != NULL && dot > name + 8)
+        *dot = 0;
+    strcat(name, ".png");
+    if ((file = malloc(POSTER_FILE_MAX)) == NULL)
+        return;
+    n = plat_data_load(name, (char *)file, POSTER_FILE_MAX);
+    rgba = n > 0 ? decode_png(file, (uint32_t)n, &w, &h, 1600, 1600) : NULL;
+    free(file);
+    if (!rgba)
+        return;
+    if ((small = malloc(POSTER_W * POSTER_H * 4)) != NULL) {
+        for (int y = 0; y < POSTER_H; y++)
+            for (int x = 0; x < POSTER_W; x++)
+                memcpy(small + ((size_t)y * POSTER_W + x) * 4,
+                       rgba + ((size_t)(y * h / POSTER_H) * w + x * w / POSTER_W) * 4, 4);
+        disc->poster = small;
+    }
+    free(rgba);
+}
+
 static void read_disc_info(lib_disc *disc)
 {
     disc_file d;
@@ -444,6 +501,7 @@ static void read_disc_info(lib_disc *disc)
     snprintf(disc->title, sizeof(disc->title), "%.95s", file_name(disc->path));
     if (strlen(disc->title) > 4 && disc->title[strlen(disc->title) - 4] == '.')
         disc->title[strlen(disc->title) - 4] = 0;   /* the file name, without .iso */
+    load_poster(disc);
     if (disc_open(&d, disc->path) < 0)
         return;
     if ((buf = disc_read(&d, "UMD_VIDEO/PARAM.SFO", &size, 64 * 1024)) != NULL) {
@@ -890,6 +948,37 @@ static void load_resume_marks(library *l)
     l->marks_stale = 0;
 }
 
+static int list_on(void)
+{
+    return settings_get()->lib_view == LIB_LIST;
+}
+
+static int shelf_on(void)
+{
+    return settings_get()->lib_view == LIB_SHELF;
+}
+
+/* The disc in the list view's top row, so the selected one stays near the middle. */
+static int list_first(const library *l)
+{
+    int first = l->sel - LIST_ROWS / 2;
+
+    if (first > l->count - LIST_ROWS)
+        first = l->count - LIST_ROWS;
+    return first < 0 ? 0 : first;
+}
+
+/* As much of s as fits in max_w pixels, ending with "..." when it was cut. out holds at least
+   size bytes, and size is more than 3. */
+static void fit_title(char *out, int size, const char *s, int scale, int max_w)
+{
+    canvas_text_fit(out, size, s, scale, max_w);
+    if (!s[strlen(out)])
+        return;
+    canvas_text_fit(out, size - 3, s, scale, max_w - canvas_text_width("...", scale));
+    strcat(out, "...");
+}
+
 static void format_time(char *out, size_t size, uint64_t ticks)
 {
     unsigned s = (unsigned)(ticks / 90000);
@@ -944,7 +1033,7 @@ static void draw_info(library *l)
        the backdrop: its title stands beside the icon, as the Select panel shows it. */
     int bare = !d->icon0 && !l->icon && !l->pic0 && !l->settings_open;
 
-    if (!l->show_info && !bare)
+    if (list_on() || shelf_on() || (!l->show_info && !bare))
         return;
     if (!l->show_info) {
         lines = wrap_title(d->title, title, title2, sizeof(title), PANEL_W - 32);
@@ -1261,14 +1350,130 @@ static void draw_app_name(canvas *c, int y)
 static void draw_hints(canvas *c, int y)
 {
     const char *key = plat_keyboard_ui() ? "F1" : "START", *lr = plat_keyboard_ui() ? "Q/E" : "L/R";
+    const char *sel = plat_keyboard_ui() ? "Tab" : "SELECT";
     int w = osd_button_width(ICON_BUTTON_TRIANGLE, 1) + 6 + canvas_text_width("Settings", 1);
     int mw = osd_key_width(key) + 6 + canvas_text_width("Manual", 1);
     int lw = osd_key_width(lr) + 6 + canvas_text_width("Letter", 1);
+    int vw = osd_key_width(sel) + 6 + canvas_text_width("View", 1);
     int x = UI_W - 20 - w;
 
     osd_draw_hint(c, x, y - 4, ICON_BUTTON_TRIANGLE, "Settings");
     osd_draw_key_hint(c, x - 24 - mw, y - 4, key, "Manual");
     osd_draw_key_hint(c, x - 48 - mw - lw, y - 4, lr, "Letter");
+    osd_draw_key_hint(c, x - 72 - mw - lw - vw, y - 4, sel, "View");
+}
+
+/* The poster view's titles: the selected disc's under the picture on the right, unless the
+   info panel already shows it, and each other disc's beside its icon. */
+static void draw_titles(library *l)
+{
+    canvas *c = &l->ui;
+    const lib_disc *d = &l->discs[l->sel];
+    char t[100];
+    int bare = !d->icon0 && !l->icon && !l->pic0;
+
+    if (!l->show_info && !bare) {
+        int w;
+        fit_title(t, sizeof(t), d->title, 2, PANEL_W - 24);
+        w = canvas_text_width(t, 2);
+        canvas_round_darken(c, PANEL_X, TITLE_Y, w + 24, 30, 8, 110);
+        canvas_text(c, PANEL_X + 12, TITLE_Y + 7, 2, RGBA(255, 255, 255, 255), t);
+    }
+    for (int k = -1; k <= 2; k++) {
+        int i = l->sel + k, y = k < 0 ? BIG_Y - 100 : BIG_Y + 2 * ICON_H + 20 + (k - 1) * 90, w;
+        if (k == 0 || i < 0 || i >= l->count)
+            continue;
+        fit_title(t, sizeof(t), l->discs[i].title, 1, NEIGHBOUR_W);
+        w = canvas_text_width(t, 1);
+        canvas_round_darken(c, NEIGHBOUR_X - 6, y + ICON_H / 2 - 10, w + 12, 20, 6, 110);
+        canvas_text(c, NEIGHBOUR_X, y + ICON_H / 2 - 4, 1, RGBA(255, 255, 255, 255), t);
+    }
+}
+
+/* One line about the disc: where it would resume, or what is wrong with it. Empty if nothing. */
+static void disc_status(const lib_disc *d, char *line, size_t size)
+{
+    char at[16], total[16];
+
+    line[0] = 0;
+    if (d->no_movie) {
+        snprintf(line, size, "No movie in this image");
+    } else if (d->has_resume && d->resume_disc) {
+        snprintf(line, size, "Continue where you left off");
+    } else if (d->has_resume) {
+        format_time(at, sizeof(at), d->resume_pos - d->resume_start);
+        if (d->resume_end > d->resume_start) {
+            format_time(total, sizeof(total), d->resume_end - d->resume_start);
+            snprintf(line, size, "Resume at %s of %s", at, total);
+        } else {
+            snprintf(line, size, "Resume at %s", at);
+        }
+    } else if (d->interactive) {
+        snprintf(line, size, "Interactive movie (UMD-PG)");
+    } else if (d->incomplete) {
+        snprintf(line, size, "Incomplete image");
+    }
+}
+
+/* The shelf view's text: the selected disc's title and status over the row, and a caption under
+   each disc in the row, with a dot on a disc with a saved position. The pictures are sprites. */
+static void draw_shelf(library *l)
+{
+    canvas *c = &l->ui;
+    const lib_disc *d = &l->discs[l->sel];
+    char t[100], l1[96], l2[96], line[64];
+    int lines = wrap_title(d->title, l1, l2, sizeof(l1), SHELF_TILES * SHELF_STEP - 24);
+
+    canvas_round_darken(c, SHELF_X - 6, SHELF_BIG_Y - 8, SHELF_TILES * SHELF_STEP, 64, 10, 90);
+    canvas_text(c, SHELF_X + 4, SHELF_BIG_Y, 2, RGBA(255, 255, 255, 255), l1);
+    if (lines > 1)
+        canvas_text(c, SHELF_X + 4, SHELF_BIG_Y + 20, 2, RGBA(255, 255, 255, 255), l2);
+    disc_status(d, line, sizeof(line));
+    if (line[0])
+        canvas_text(c, SHELF_X + 4, SHELF_BIG_Y + 42, 1, d->no_movie || d->incomplete ? RGBA(255, 120, 100, 255) : TEXT_DIM, line);
+    for (int k = 1; k <= SHELF_TILES && l->sel + k < l->count; k++) {
+        const lib_disc *e = &l->discs[l->sel + k];
+        int x = SHELF_X + (k - 1) * SHELF_STEP, w;
+        fit_title(t, sizeof(t), e->title, 1, SHELF_W);
+        w = canvas_text_width(t, 1);
+        canvas_round_darken(c, x - 2, SHELF_Y + SHELF_H + 4, w + 6, 16, 4, 110);
+        canvas_text(c, x, SHELF_Y + SHELF_H + 8, 1, RGBA(255, 255, 255, 255), t);
+        if (e->has_resume)
+            canvas_round_rect(c, x + SHELF_W - 16, SHELF_Y + 6, 10, 10, 5, RGBA(120, 190, 255, 255));
+    }
+}
+
+/* The list view: a page of titles beside the selected disc's icon, with its full title and
+   resume point under the icon. A dot marks a disc with a saved position. */
+static void draw_list(library *l)
+{
+    canvas *c = &l->ui;
+    const lib_disc *d = &l->discs[l->sel];
+    char t[100], l1[96], l2[96], line[64];
+    int first = list_first(l), lines, y = BIG_Y + 2 * ICON_H + 8;
+
+    canvas_round_darken(c, LIST_X - 6, LIST_Y - 6, LIST_W + 12, LIST_ROWS * LIST_ROW + 12, 12, 90);
+    for (int r = 0; r < LIST_ROWS && first + r < l->count; r++) {
+        int i = first + r, ry = LIST_Y + r * LIST_ROW;
+        const lib_disc *e = &l->discs[i];
+        fit_title(t, sizeof(t), e->title, 2, LIST_W - 40);
+        if (i == l->sel)
+            canvas_round_rect(c, LIST_X, ry, LIST_W, LIST_ROW, 6, RGBA(55, 95, 180, 255));
+        canvas_text(c, LIST_X + 8, ry + 6, 2, e->no_movie ? RGBA(255, 120, 100, 255) : i == l->sel ? RGBA(255, 255, 255, 255) : TEXT_DIM, t);
+        if (e->has_resume)
+            canvas_round_rect(c, LIST_X + LIST_W - 20, ry + 9, 10, 10, 5, RGBA(120, 190, 255, 255));
+    }
+
+    lines = wrap_title(d->title, l1, l2, sizeof(l1), 2 * ICON_W - 16);
+    canvas_round_darken(c, BIG_X, y, 2 * ICON_W, 84, 10, 90);
+    canvas_text(c, BIG_X + 8, y + 6, 2, RGBA(255, 255, 255, 255), l1);
+    if (lines > 1)
+        canvas_text(c, BIG_X + 8, y + 26, 2, RGBA(255, 255, 255, 255), l2);
+    disc_status(d, line, sizeof(line));
+    if (line[0])
+        canvas_text(c, BIG_X + 8, y + 50, 1, d->no_movie || d->incomplete ? RGBA(255, 120, 100, 255) : TEXT_DIM, line);
+    if (d->has_resume && !d->no_movie)
+        canvas_text(c, BIG_X + 8, y + 66, 1, TEXT_DIM, "Square: from the beginning");
 }
 
 /* A disc without ICON0 or ICON1 (Monster Hunter Portable Rookie's Guide, which shows none on a
@@ -1293,10 +1498,17 @@ static void draw_front(library *l)
 {
     canvas *c = &l->ui;
 
-    fill_icon_corners(l);
+    if (!shelf_on())
+        fill_icon_corners(l);
     draw_info(l);
     draw_settings(l);
     if (!l->settings_open) {
+        if (list_on())
+            draw_list(l);
+        else if (shelf_on())
+            draw_shelf(l);
+        else
+            draw_titles(l);
         draw_letter(l);
         draw_strip(l);
     }
@@ -1370,13 +1582,40 @@ static void add_icon(library *l, lib_disc *d, int x, int y, int w, int h)
     }
 }
 
+/* A disc's picture in a shelf slot: its poster, else its wide icon centred in the slot. */
+static void add_art(library *l, lib_disc *d, int x, int y, int w, int h)
+{
+    if (d->poster) {
+        if (!d->poster_id)
+            d->poster_id = lib_id();
+        add_sprite(l, d->poster, POSTER_W, POSTER_H, d->poster_id, x, y, w, h);
+    } else {
+        int ih = w * ICON_H / ICON_W;
+        add_icon(l, d, x, y + (h - ih) / 2, w, ih);
+    }
+}
+
+/* The same for the platforms where the app draws everything itself. */
+static void blit_art(library *l, const lib_disc *d, int x, int y, int w, int h)
+{
+    canvas *c = &l->ui;
+    int ih = w * ICON_H / ICON_W;
+
+    if (d->poster)
+        canvas_blit(c, d->poster, POSTER_W, POSTER_H, POSTER_W * 4, x, y, w, h);
+    else if (d->icon0)
+        canvas_blit(c, d->icon0, d->icon_w, d->icon_h, d->icon_w * 4, x, y + (h - ih) / 2, w, ih);
+    else
+        draw_no_icon(c, x, y + (h - ih) / 2, w, ih);
+}
+
 /* What draw_front shows depends on: a copy of each, compared to redraw only on a change. */
 static void front_key(library *l, unsigned char *key, size_t size)
 {
     struct {
         const void *bg;
         int show_info, bare, settings_open, settings_row, keys, scanning, count, scan_total;
-        int sheet_shown, sheet_done, sheet_total, letter_shown, strip_shown;
+        int sheet_shown, sheet_done, sheet_total, letter_shown, strip_shown, sel;
         unsigned notice_seq;
         app_settings settings;
         const lib_disc *disc;
@@ -1403,7 +1642,8 @@ static void front_key(library *l, unsigned char *key, size_t size)
     k.sheet_total = l->sheet_total;
     k.notice_seq = l->notice[0] ? l->notice_seq : 0;
     k.settings = *settings_get();
-    if (k.show_info || k.bare) {
+    k.sel = l->sel;                   /* the titles on screen follow the selection in every view */
+    if (l->count > 0) {
         k.disc = d;
         k.shown = *d;
     }
@@ -1430,7 +1670,7 @@ static void draw_ui_sprites(library *l)
         add_sprite(l, backdrop_rgba(), BACKDROP_W, BACKDROP_H, backdrop_bg_id, 0, 0, UI_W, UI_H);
     }
     l->info.ui_sprites_below = l->info.ui_sprite_count;
-    if (l->pic0 && !l->show_info && !l->settings_open) {
+    if (l->pic0 && !l->show_info && !l->settings_open && !list_on() && !shelf_on()) {
         if (!l->pic0_id)
             l->pic0_id = lib_id();
         add_sprite(l, l->pic0, l->pic0_w, l->pic0_h, l->pic0_id, UI_W - 2 * l->pic0_w - 10, (UI_H - 2 * l->pic0_h) / 2,
@@ -1438,11 +1678,16 @@ static void draw_ui_sprites(library *l)
     }
     for (int k = -1; k <= 2; k++) {
         int i = l->sel + k, y = k < 0 ? BIG_Y - 100 : BIG_Y + 2 * ICON_H + 20 + (k - 1) * 90;
-        if (k != 0 && i >= 0 && i < l->count)
+        if (k != 0 && i >= 0 && i < l->count && !list_on() && !shelf_on())
             add_icon(l, &l->discs[i], SMALL_X, y, ICON_W, ICON_H);
     }
-    if (!l->icon || !l->shown)
+    if (shelf_on()) {
+        add_art(l, &l->discs[l->sel], SHELF_BIG_X, SHELF_BIG_Y, SHELF_BIG_W, SHELF_BIG_H);
+        for (int k = 1; k <= SHELF_TILES && l->sel + k < l->count; k++)
+            add_art(l, &l->discs[l->sel + k], SHELF_X + (k - 1) * SHELF_STEP, SHELF_Y, SHELF_W, SHELF_H);
+    } else if (!l->icon || !l->shown) {
         add_icon(l, &l->discs[l->sel], BIG_X, BIG_Y, 2 * ICON_W, 2 * ICON_H);
+    }
 
     front_key(l, key, sizeof(key));
     if (memcmp(key, l->front_key, sizeof(key)) != 0 || !l->info.ui_rgba) {
@@ -1495,7 +1740,7 @@ static void draw_ui(library *l)
     draw_background(l);
     /* PIC0 at twice its size (the PSP's 480x272 screen doubled), right of the icon; the info
        panel and the settings take its place when open. */
-    if (l->pic0 && !l->show_info && !l->settings_open)
+    if (l->pic0 && !l->show_info && !l->settings_open && !list_on() && !shelf_on())
         canvas_blit(c, l->pic0, l->pic0_w, l->pic0_h, l->pic0_w * 4, UI_W - 2 * l->pic0_w - 10,
                     (UI_H - 2 * l->pic0_h) / 2, 2 * l->pic0_w, 2 * l->pic0_h);
 
@@ -1503,7 +1748,7 @@ static void draw_ui(library *l)
     for (int k = -1; k <= 2; k++) {
         int i = l->sel + k, y = k < 0 ? BIG_Y - 100 : BIG_Y + 2 * ICON_H + 20 + (k - 1) * 90;
         const lib_disc *d;
-        if (k == 0 || i < 0 || i >= l->count)
+        if (k == 0 || i < 0 || i >= l->count || list_on() || shelf_on())
             continue;
         d = &l->discs[i];
         if (d->icon0)
@@ -1514,7 +1759,11 @@ static void draw_ui(library *l)
 
     /* The selected disc: its ICON1 animation shows through a transparent hole, else ICON0, with
        rounded corners. */
-    if (l->icon) {
+    if (shelf_on()) {
+        blit_art(l, &l->discs[l->sel], SHELF_BIG_X, SHELF_BIG_Y, SHELF_BIG_W, SHELF_BIG_H);
+        for (int k = 1; k <= SHELF_TILES && l->sel + k < l->count; k++)
+            blit_art(l, &l->discs[l->sel + k], SHELF_X + (k - 1) * SHELF_STEP, SHELF_Y, SHELF_W, SHELF_H);
+    } else if (l->icon) {
         canvas_round_rect(c, BIG_X, BIG_Y, 2 * ICON_W, 2 * ICON_H, BIG_R, RGBA(0, 0, 0, 0));
     } else if (l->discs[l->sel].icon0) {
         const lib_disc *d = &l->discs[l->sel];
@@ -1840,6 +2089,7 @@ library *library_open(const char *dir)
     l->loaded = -1;
     l->sheet_shown = -1;
     l->ui_dirty = 1;
+    l->show_info = settings_get()->lib_view == LIB_DETAILS;
     l->info.video_w = ICON_W;
     l->info.video_h = ICON_H;
     l->info.dst = (plat_rect){(float)BIG_X / UI_W, (float)BIG_Y / UI_H, 2.0f * ICON_W / UI_W, 2.0f * ICON_H / UI_H};
@@ -1936,12 +2186,14 @@ static void draw_empty(library *l)
 static uint32_t touch_buttons(library *l)
 {
     int x, y, down = plat_touch(&x, &y);
+    int drag = list_on() ? LIST_ROW : DRAG_STEP;
     uint32_t b = 0;
 
     if (down && !l->touch_down) {
         l->touch_down = 1;
         l->touch_x0 = x;
         l->touch_y0 = l->touch_step_y = y;
+        l->touch_step_x = x;
         l->touch_moved = 0;
         l->strip_touch = !l->settings_open && x >= UI_W - STRIP_W - 16 && y >= STRIP_TOP - 20 && y < STRIP_BOTTOM + 20;
     }
@@ -1957,11 +2209,21 @@ static uint32_t touch_buttons(library *l)
     if (down) {
         if (abs(x - l->touch_x0) > TAP_MOVE || abs(y - l->touch_y0) > TAP_MOVE)
             l->touch_moved = 1;
-        if (y - l->touch_step_y <= -DRAG_STEP) {     /* the list follows the finger up: next disc */
-            l->touch_step_y -= DRAG_STEP;
+        if (shelf_on()) {                            /* the row follows the finger left: next disc */
+            if (x - l->touch_step_x <= -SHELF_DRAG) {
+                l->touch_step_x -= SHELF_DRAG;
+                b |= PLAT_BTN_DOWN;
+            } else if (x - l->touch_step_x >= SHELF_DRAG) {
+                l->touch_step_x += SHELF_DRAG;
+                b |= PLAT_BTN_UP;
+            }
+            return b;
+        }
+        if (y - l->touch_step_y <= -drag) {          /* the list follows the finger up: next disc */
+            l->touch_step_y -= drag;
             b |= PLAT_BTN_DOWN;
-        } else if (y - l->touch_step_y >= DRAG_STEP) {
-            l->touch_step_y += DRAG_STEP;
+        } else if (y - l->touch_step_y >= drag) {
+            l->touch_step_y += drag;
             b |= PLAT_BTN_UP;
         }
         return b;
@@ -1973,8 +2235,34 @@ static uint32_t touch_buttons(library *l)
         return 0;
     x = l->touch_x0;
     y = l->touch_y0;
+    if (shelf_on()) {                            /* the big poster plays; a tile selects its disc */
+        if (x >= SHELF_BIG_X && x < SHELF_BIG_X + SHELF_BIG_W && y >= SHELF_BIG_Y && y < SHELF_BIG_Y + SHELF_BIG_H)
+            return PLAT_BTN_CROSS;
+        if (y < SHELF_Y || y >= SHELF_Y + SHELF_H)
+            return 0;
+        for (int k = 1; k <= SHELF_TILES; k++) {
+            int left = SHELF_X + (k - 1) * SHELF_STEP;
+            if (x >= left && x < left + SHELF_W && l->sel + k < l->count) {
+                l->sel += k - 1;                 /* the Down below makes it k */
+                return PLAT_BTN_DOWN;
+            }
+        }
+        return 0;
+    }
     if (x >= BIG_X && x < BIG_X + 2 * ICON_W && y >= BIG_Y && y < BIG_Y + 2 * ICON_H)
         return PLAT_BTN_CROSS;
+    if (list_on()) {                             /* a row: select it, or play it when selected */
+        int i;
+        if (x < LIST_X || x >= LIST_X + LIST_W || y < LIST_Y || y >= LIST_Y + LIST_ROWS * LIST_ROW)
+            return 0;
+        i = list_first(l) + (y - LIST_Y) / LIST_ROW;
+        if (i >= l->count)
+            return 0;
+        if (i == l->sel)
+            return PLAT_BTN_CROSS;
+        l->sel = i > l->sel ? i - 1 : i + 1;     /* the Up or Down below makes it i */
+        return i > l->sel ? PLAT_BTN_DOWN : PLAT_BTN_UP;
+    }
     if (x < SMALL_X - 16 || x >= SMALL_X + ICON_W + 16)
         return 0;
     if (y >= BIG_Y - 100 && y < BIG_Y - 100 + ICON_H)
@@ -2046,12 +2334,13 @@ static int stick_steps(library *l)
    itself moves one, as before. Negative is up. */
 static int hold_steps(library *l, uint32_t pressed)
 {
-    uint32_t held = plat_buttons() & (PLAT_BTN_UP | PLAT_BTN_DOWN);
+    uint32_t back = shelf_on() ? PLAT_BTN_LEFT : PLAT_BTN_UP, on = shelf_on() ? PLAT_BTN_RIGHT : PLAT_BTN_DOWN;
+    uint32_t held = plat_buttons() & (back | on);
     uint64_t now = plat_time_us();
     float t, rate;
     int n;
 
-    if (held != PLAT_BTN_UP && held != PLAT_BTN_DOWN) {
+    if (held != back && held != on) {
         l->hold_dir = 0;
         return 0;
     }
@@ -2071,7 +2360,7 @@ static int hold_steps(library *l, uint32_t pressed)
     l->hold_us = now;
     n = (int)l->hold_acc;
     l->hold_acc -= (float)n;
-    return held == PLAT_BTN_UP ? -n : n;
+    return held == back ? -n : n;
 }
 
 /* L and R jump a letter: R to the first disc of the next letter, L to the first disc of this
@@ -2248,8 +2537,13 @@ int library_update(library *l, uint32_t pressed)
     }
     if (pressed & PLAT_BTN_CROSS)
         return l->sel;
-    if (pressed & PLAT_BTN_SELECT) {
-        l->show_info = !l->show_info;
+    if (pressed & PLAT_BTN_SELECT) {             /* list, shelf, icons, icons with the info panel */
+        static const int next[LIB_VIEWS] = {[LIB_LIST] = LIB_SHELF, [LIB_SHELF] = LIB_POSTERS,
+                                            [LIB_POSTERS] = LIB_DETAILS, [LIB_DETAILS] = LIB_LIST};
+        app_settings *s = settings_get();
+        s->lib_view = next[s->lib_view];
+        l->show_info = s->lib_view == LIB_DETAILS;
+        settings_save();
         l->ui_dirty = 1;
     }
     if ((pressed & PLAT_BTN_SQUARE) && l->discs[l->sel].has_resume) {
@@ -2273,9 +2567,9 @@ int library_update(library *l, uint32_t pressed)
         to += l->settings_open ? 0 : stick_steps(l) + hold_steps(l, pressed);
         if (l->stick_on)
             pressed &= ~(uint32_t)(PLAT_BTN_UP | PLAT_BTN_DOWN);
-        if (pressed & PLAT_BTN_UP)
+        if ((pressed & PLAT_BTN_UP) || (shelf_on() && (pressed & PLAT_BTN_LEFT)))
             to--;
-        else if (pressed & PLAT_BTN_DOWN)
+        else if ((pressed & PLAT_BTN_DOWN) || (shelf_on() && (pressed & PLAT_BTN_RIGHT)))
             to++;
         if (to > l->count - 1)
             to = l->count - 1;
@@ -2329,7 +2623,7 @@ int library_update(library *l, uint32_t pressed)
     }
     t3 = plat_time_us();
     if (present)
-        plat_present(l->icon ? l->shown : NULL, &l->info);
+        plat_present(l->icon && !shelf_on() ? l->shown : NULL, &l->info);
     t4 = plat_time_us();
     l->perf.media += t1 - t0;
     l->perf.icon += t2 - t1;
@@ -2390,6 +2684,7 @@ void library_close(library *l)
     for (int i = 0; i < CACHE_N; i++)
         free_media(&l->cache[i]);
     for (int i = 0; i < l->scan_total; i++)
+        free(l->discs[i].poster);
         free(l->discs[i].icon0);
     free(l->discs);
     plat_cond_destroy(l->cache_cond);

@@ -8,7 +8,11 @@
 #define SUBS_OFF    "off"
 #define SUBS_SYSTEM "sys"
 
+/* How the library shows the discs; Select goes through them. */
+enum { LIB_LIST, LIB_POSTERS, LIB_DETAILS, LIB_SHELF, LIB_VIEWS };
+
 typedef struct app_settings {
+    int lib_view;             /* LIB_LIST, LIB_POSTERS, LIB_DETAILS or LIB_SHELF */
     int screen;               /* screen_mode */
     char audio[3];            /* ISO 639-1 language of the preferred audio track */
     char subs[4];             /* SUBS_OFF, SUBS_SYSTEM, or an ISO 639-1 language */

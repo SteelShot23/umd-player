@@ -62,10 +62,12 @@ app_settings *settings_get(void)
     buf[n] = 0;
     for (line = strtok_r(buf, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
         char key[16], value[16];
-        int screen;
+        int screen, view;
         if (sscanf(line, "%15s %15s", key, value) != 2)
             continue;
-        if (strcmp(key, "screen") == 0 && sscanf(value, "%d", &screen) == 1 && screen >= 0 && screen < SCREEN_MODES)
+        if (strcmp(key, "view") == 0 && sscanf(value, "%d", &view) == 1 && view >= 0 && view < LIB_VIEWS)
+            s.lib_view = view;
+        else if (strcmp(key, "screen") == 0 && sscanf(value, "%d", &screen) == 1 && screen >= 0 && screen < SCREEN_MODES)
             s.screen = screen;
         else if (strcmp(key, "audio") == 0 && strlen(value) == 2)
             snprintf(s.audio, sizeof(s.audio), "%s", value);
@@ -89,8 +91,8 @@ void settings_save(void)
 {
     const app_settings *s = settings_get();
     char buf[224];
-    int n = snprintf(buf, sizeof(buf), "screen %d\naudio %s\nsubtitles %s\nstart %s\nsheets %s\nscanlines %s\nlogs %s\nskipclips %s\n",
-                     s->screen, s->audio, s->subs, s->start_disc ? "disc" : "movie", s->info_sheets ? "on" : "off",
+    int n = snprintf(buf, sizeof(buf), "view %d\nscreen %d\naudio %s\nsubtitles %s\nstart %s\nsheets %s\nscanlines %s\nlogs %s\nskipclips %s\n",
+                     s->lib_view, s->screen, s->audio, s->subs, s->start_disc ? "disc" : "movie", s->info_sheets ? "on" : "off",
                      s->scanlines ? "on" : "off", s->logs ? "on" : "off", s->skip_clips ? "on" : "off");
 
     if (plat_data_save(FILE_NAME, buf, n) < 0)
