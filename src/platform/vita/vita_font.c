@@ -84,6 +84,8 @@ int plat_glyph(uint32_t cp, int px, uint8_t *alpha)
         advance = (int)(ci.sfp26AdvanceH / 64.0f * f + 0.5f);
         if (advance <= 0)
             continue;
+        if (ci.bitmapWidth == 0 || ci.bitmapHeight == 0)
+            return advance > w ? w : advance;  /* a space: nothing to draw */
         memset(buf, 0, sizeof(buf));
         memset(&img, 0, sizeof(img));
         img.pixelFormat = SCE_FONT_PIXELFORMAT_8;
@@ -93,15 +95,31 @@ int plat_glyph(uint32_t cp, int px, uint8_t *alpha)
         img.bufferPtr = (unsigned int)buf;
         if (sceFontGetCharGlyphImage(fonts[i], cp, &img) < 0)
             continue;
-        /* nearest sample of the glyph, its top bitmapTop above the baseline */
-        for (int y = 0; y < px; y++) {
-            int sy = (int)((y - (base - (int)ci.bitmapTop * f)) / f);
-            if (sy < 0 || sy >= (int)ci.bitmapHeight)
-                continue;
-            for (int x = 0; x < w; x++) {
-                int sx = (int)((x - (int)ci.bitmapLeft * f) / f);
-                if (sx >= 0 && sx < (int)ci.bitmapWidth)
-                    alpha[y * w + x] = buf[sy * BUF_W + sx];
+        /* The glyph scaled to the text height, its top bitmapTop above the baseline: each pixel
+           averages nine samples, which keeps small text smooth. Done once per character. */
+        {
+            float top = base - (int)ci.bitmapTop * f, left = (int)ci.bitmapLeft * f;
+            int x_end = (int)(left + (int)ci.bitmapWidth * f) + 2;
+
+            if (x_end > w)
+                x_end = w;
+            for (int y = 0; y < px; y++) {
+                for (int x = 0; x < x_end; x++) {
+                    int sum = 0;
+                    for (int j = 0; j < 3; j++) {
+                        float gy = ((float)y + (float)(2 * j + 1) / 6.0f - top) / f;
+                        int sy = (int)gy;
+                        if (gy < 0 || sy >= (int)ci.bitmapHeight)
+                            continue;
+                        for (int i = 0; i < 3; i++) {
+                            float gx = ((float)x + (float)(2 * i + 1) / 6.0f - left) / f;
+                            int sx = (int)gx;
+                            if (gx >= 0 && sx < (int)ci.bitmapWidth)
+                                sum += buf[sy * BUF_W + sx];
+                        }
+                    }
+                    alpha[y * w + x] = (uint8_t)(sum / 9);
+                }
             }
         }
         return advance > w ? w : advance;

@@ -333,6 +333,15 @@ int plat_data_save(const char *name, const char *buf, int size)
 
     sceIoMkdir("ux0:data/umdplayer", 0777);
     snprintf(path, sizeof(path), "ux0:data/umdplayer/%s", name);
+    {
+        /* a name like cache/disc.bin: its folder, too */
+        const char *slash = strchr(name, '/');
+        if (slash) {
+            char dir[256];
+            snprintf(dir, sizeof(dir), "ux0:data/umdplayer/%.*s", (int)(slash - name), name);
+            sceIoMkdir(dir, 0777);
+        }
+    }
     snprintf(tmp, sizeof(tmp), "%s.new", path);
     if ((fd = sceIoOpen(tmp, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666)) < 0)
         return -1;
