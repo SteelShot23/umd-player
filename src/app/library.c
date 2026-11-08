@@ -86,10 +86,11 @@
 #define SHELF_STEP     135
 #define SHELF_TILES    5
 #define SHELF_DRAG     110             /* finger travel per disc when swiping the row */
-/* A poster is ux0:data/umdplayer/posters/<the image's name>.png, kept in memory at this size:
-   the shape of a UMD Video case. */
-#define POSTER_W       140
-#define POSTER_H       240
+/* A poster is ux0:data/umdplayer/posters/<the image's name>.png. Every disc keeps one in memory
+   at the row's size; the worker makes the big one when a disc is selected or near it. Each is
+   exactly the size it is drawn at, as the Vita draws sprites with the nearest texel. */
+#define POSTER_W       SHELF_W
+#define POSTER_H       SHELF_H
 #define POSTER_FILE_MAX (3 * 1024 * 1024)
 /* Details are ux0:data/umdplayer/info/<the image's name>.txt, "key value" lines from the poster
    script. Circle shows them on a page beside the poster. */
@@ -156,6 +157,8 @@ typedef struct media {
     int pic0_w, pic0_h;
     icon_video *icon;                /* or NULL */
     uint32_t bg_id, pic0_id;         /* the pictures' ids for the GPU while this entry lives */
+    uint8_t *big_poster;             /* RGBA, SHELF_BIG_W x SHELF_BIG_H, or NULL */
+    uint32_t big_poster_id;
     uint8_t *snd;
     uint32_t snd_size;
 } media;
@@ -188,6 +191,8 @@ struct library {
     volatile int sheet_stop, sheet_permille;
 
     const uint8_t *bg;
+    const uint8_t *big_poster;       /* the selected disc's big poster, once the worker has it */
+    uint32_t big_poster_id;
     const uint8_t *pic0;             /* the shown disc's title image, and its size */
     int pic0_w, pic0_h;
     const icon_video *icon;
@@ -481,11 +486,12 @@ static int file_end(void *user, const char *path, const iso_entry *e)
     return 0;
 }
 
-/* The disc's poster, if the data folder has one, scaled to POSTER_W x POSTER_H. */
-static void load_poster(lib_disc *disc)
+/* The disc's poster at dw x dh, or NULL if the data folder has none. Each pixel is the average of
+   the pixels of the file it covers, which keeps the small print on the case readable. */
+static uint8_t *load_poster_size(const lib_disc *disc, int dw, int dh)
 {
     char name[240], *dot;
-    uint8_t *file, *rgba, *small;
+    uint8_t *file, *rgba, *out;
     int n, w = 0, h = 0;
 
     snprintf(name, sizeof(name), "posters/%.220s", file_name(disc->path));
@@ -493,20 +499,45 @@ static void load_poster(lib_disc *disc)
         *dot = 0;
     strcat(name, ".png");
     if ((file = malloc(POSTER_FILE_MAX)) == NULL)
-        return;
+        return NULL;
     n = plat_data_load(name, (char *)file, POSTER_FILE_MAX);
     rgba = n > 0 ? decode_png(file, (uint32_t)n, &w, &h, 1600, 1600) : NULL;
     free(file);
     if (!rgba)
-        return;
-    if ((small = malloc(POSTER_W * POSTER_H * 4)) != NULL) {
-        for (int y = 0; y < POSTER_H; y++)
-            for (int x = 0; x < POSTER_W; x++)
-                memcpy(small + ((size_t)y * POSTER_W + x) * 4,
-                       rgba + ((size_t)(y * h / POSTER_H) * w + x * w / POSTER_W) * 4, 4);
-        disc->poster = small;
+        return NULL;
+    if ((out = malloc((size_t)dw * dh * 4)) != NULL) {
+        uint8_t *to = out;
+        for (int y = 0; y < dh; y++) {
+            int y0 = y * h / dh, y1 = (y + 1) * h / dh;
+            if (y1 <= y0)
+                y1 = y0 + 1;
+            for (int x = 0; x < dw; x++) {
+                int x0 = x * w / dw, x1 = (x + 1) * w / dw;
+                uint32_t sum[4] = {0, 0, 0, 0}, count;
+                if (x1 <= x0)
+                    x1 = x0 + 1;
+                count = (uint32_t)(x1 - x0) * (uint32_t)(y1 - y0);
+                for (int sy = y0; sy < y1; sy++) {
+                    const uint8_t *from = rgba + ((size_t)sy * w + x0) * 4;
+                    for (int sx = x0; sx < x1; sx++, from += 4) {
+                        sum[0] += from[0];
+                        sum[1] += from[1];
+                        sum[2] += from[2];
+                        sum[3] += from[3];
+                    }
+                }
+                for (int k = 0; k < 4; k++)
+                    *to++ = (uint8_t)(sum[k] / count);
+            }
+        }
     }
     free(rgba);
+    return out;
+}
+
+static void load_poster(lib_disc *disc)
+{
+    disc->poster = load_poster_size(disc, POSTER_W, POSTER_H);
 }
 
 /* The disc's details, if the data folder has them. */
@@ -893,6 +924,7 @@ static void free_media(media *m)
 {
     free(m->bg);
     free(m->pic0);
+    free(m->big_poster);
     free_icon(m->icon);
     free(m->snd);
     memset(m, 0, sizeof(*m));
@@ -906,6 +938,8 @@ static void read_media(const lib_disc *disc, media *m)
     uint8_t *buf;
     uint32_t size;
 
+    if (disc->poster)
+        m->big_poster = load_poster_size(disc, SHELF_BIG_W, SHELF_BIG_H);
     if (disc_open(&d, disc->path) < 0)
         return;
     if ((buf = disc_read(&d, "UMD_VIDEO/PIC1.PNG", &size, 2 * 1024 * 1024)) != NULL) {
@@ -1170,6 +1204,25 @@ static void drop_frames(library *l)
     l->shown = NULL;
 }
 
+/* Shows the selected disc's big poster if the worker has made it. Unlike the rest of the media
+   this needs no settling, so stepping to a neighbour is sharp at once. The worker keeps the entries
+   near its want_sel, so call this after tell_worker. */
+static void use_big_poster(library *l)
+{
+    media *m;
+
+    plat_mutex_lock(l->cache_lock);
+    m = find_media(l, l->sel);
+    if (m && m->state == MEDIA_READY && m->big_poster) {
+        if (!m->big_poster_id)
+            m->big_poster_id = lib_id();
+        l->big_poster = m->big_poster;
+        l->big_poster_id = m->big_poster_id;
+        l->ui_dirty = 1;
+    }
+    plat_mutex_unlock(l->cache_lock);
+}
+
 /* Stops showing the current disc's media; the decoder and sound port stay open. */
 static void clear_media(library *l)
 {
@@ -1177,6 +1230,7 @@ static void clear_media(library *l)
     l->icon = NULL;
     l->bg = NULL;
     l->pic0 = NULL;
+    l->big_poster = NULL;
     plat_mutex_lock(l->lock);
     l->snd = NULL;
     plat_mutex_unlock(l->lock);
@@ -1218,6 +1272,7 @@ static int load_media(library *l)
     plat_mutex_unlock(l->cache_lock);
 
     l->ui_dirty = 1;
+    use_big_poster(l);
     l->bg = m->bg;
     l->pic0 = m->pic0;
     /* The GPU's copies stay with the cache entry: back on a disc, nothing is copied again. */
@@ -1873,7 +1928,10 @@ static void draw_ui_sprites(library *l)
             add_icon(l, &l->discs[i], SMALL_X, y, ICON_W, ICON_H);
     }
     if (shelf_on()) {
-        add_art(l, &l->discs[l->sel], SHELF_BIG_X, SHELF_BIG_Y, SHELF_BIG_W, SHELF_BIG_H);
+        if (l->big_poster)
+            add_sprite(l, l->big_poster, SHELF_BIG_W, SHELF_BIG_H, l->big_poster_id, SHELF_BIG_X, SHELF_BIG_Y, SHELF_BIG_W, SHELF_BIG_H);
+        else
+            add_art(l, &l->discs[l->sel], SHELF_BIG_X, SHELF_BIG_Y, SHELF_BIG_W, SHELF_BIG_H);
         for (int k = 1; !details_open && k <= SHELF_TILES && l->sel + k < l->count; k++)
             add_art(l, &l->discs[l->sel + k], SHELF_X + (k - 1) * SHELF_STEP, SHELF_Y, SHELF_W, SHELF_H);
     } else if (!l->icon || !l->shown) {
@@ -1951,7 +2009,10 @@ static void draw_ui(library *l)
     /* The selected disc: its ICON1 animation shows through a transparent hole, else ICON0, with
        rounded corners. */
     if (shelf_on()) {
-        blit_art(l, &l->discs[l->sel], SHELF_BIG_X, SHELF_BIG_Y, SHELF_BIG_W, SHELF_BIG_H);
+        if (l->big_poster)
+            canvas_blit(c, l->big_poster, SHELF_BIG_W, SHELF_BIG_H, SHELF_BIG_W * 4, SHELF_BIG_X, SHELF_BIG_Y, SHELF_BIG_W, SHELF_BIG_H);
+        else
+            blit_art(l, &l->discs[l->sel], SHELF_BIG_X, SHELF_BIG_Y, SHELF_BIG_W, SHELF_BIG_H);
         for (int k = 1; !details_open && k <= SHELF_TILES && l->sel + k < l->count; k++)
             blit_art(l, &l->discs[l->sel + k], SHELF_X + (k - 1) * SHELF_STEP, SHELF_Y, SHELF_W, SHELF_H);
     } else if (l->icon) {
@@ -2805,6 +2866,8 @@ int library_update(library *l, uint32_t pressed)
     }
     if (pressed || l->worker_paused)
         tell_worker(l, 0);
+    if (pressed || !l->big_poster)
+        use_big_poster(l);
     if (l->letter_shown && plat_time_us() - l->letter_us >= LETTER_SHOW && !l->strip_touch) {
         l->letter_shown = 0;
         l->ui_dirty = 1;
