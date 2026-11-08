@@ -112,10 +112,19 @@ typedef struct cached_glyph {
 
 static canvas_glyph_fn glyph_source;
 static cached_glyph *cache[CACHE_SLOTS];
+/* ASCII at each small scale, kept for good: nearly all the text there is, and a slot of the cache
+   above lost to a collision would mean asking the font again on every redraw. */
+#define ASCII_SCALES 4
+static cached_glyph *ascii_cache[ASCII_SCALES][95];
 
 void canvas_set_glyph_source(canvas_glyph_fn fn)
 {
     glyph_source = fn;
+    for (int s = 0; s < ASCII_SCALES; s++)
+        for (int i = 0; i < 95; i++) {
+            free(ascii_cache[s][i]);
+            ascii_cache[s][i] = NULL;
+        }
     for (int i = 0; i < CACHE_SLOTS; i++)
         if (cache[i])
             cache[i]->px = 0;
@@ -143,8 +152,41 @@ static const cached_glyph *lookup(uint32_t cp, int px)
     return g->advance > 0 ? g : NULL;
 }
 
+/* The height a scale's text is drawn at with the source's font. Its letters are slimmer than the
+   8x8 font's, so these are taller than 8 * scale to match its capitals; draw_char centres them. */
+static int text_px(int scale)
+{
+    return scale == 1 ? 13 : scale == 2 ? 22 : 8 * scale;
+}
+
+/* The source's glyph for a printable ASCII character, or NULL to use the 8x8 font. */
+static const cached_glyph *ascii_lookup(uint32_t cp, int scale)
+{
+    cached_glyph **slot;
+
+    if (!glyph_source || scale < 1 || scale > ASCII_SCALES || cp < 32 || cp > 126)
+        return NULL;
+    slot = &ascii_cache[scale - 1][cp - 32];
+    if (!*slot) {
+        cached_glyph *g = malloc(sizeof(cached_glyph));
+        if (!g)
+            return NULL;
+        memset(g->alpha, 0, sizeof(g->alpha));
+        g->cp = cp;
+        g->px = text_px(scale);
+        g->advance = glyph_source(cp, g->px, g->alpha);
+        if (g->advance > 2 * g->px)
+            g->advance = 2 * g->px;
+        *slot = g;
+    }
+    return (*slot)->advance > 0 ? *slot : NULL;
+}
+
+/* Drawing text calls this for every pixel of every letter, and the Vita's CPU divides in software:
+   the usual cases need no division by a variable, and the rest uses a table of inverses. */
 static void blend(canvas *c, int x, int y, uint32_t rgba, int a)
 {
+    static uint32_t inverse[256];
     uint8_t *d;
     int sa = a * (int)(rgba & 0xFF) / 255, da, oa;
 
@@ -152,13 +194,30 @@ static void blend(canvas *c, int x, int y, uint32_t rgba, int a)
         return;
     d = c->rgba + (size_t)y * c->stride + (size_t)x * 4;
     da = d[3];
+    if (sa == 255 || da == 0) {               /* only the new colour shows */
+        d[0] = (uint8_t)(rgba >> 24);
+        d[1] = (uint8_t)(rgba >> 16);
+        d[2] = (uint8_t)(rgba >> 8);
+        d[3] = (uint8_t)sa;
+        return;
+    }
+    if (da == 255) {                          /* over something opaque */
+        for (int i = 0; i < 3; i++) {
+            int sc = (int)(rgba >> (24 - 8 * i)) & 0xFF;
+            d[i] = (uint8_t)((sc * sa + d[i] * (255 - sa)) / 255);
+        }
+        return;
+    }
     oa = sa + da * (255 - sa) / 255;
     if (oa == 0)
         return;
+    if (!inverse[1])
+        for (int i = 1; i < 256; i++)
+            inverse[i] = 65536u / (uint32_t)i;
     for (int i = 0; i < 3; i++) {
         int sc = (int)(rgba >> (24 - 8 * i)) & 0xFF;
-        int v = (sc * sa + d[i] * da * (255 - sa) / 255) / oa;
-        d[i] = (uint8_t)(v > 255 ? 255 : v);      /* rounding can reach 256 */
+        uint32_t v = ((uint32_t)(sc * sa + d[i] * da * (255 - sa) / 255) * inverse[oa]) >> 16;
+        d[i] = (uint8_t)(v > 255 ? 255 : v);
     }
     d[3] = (uint8_t)oa;
 }
@@ -178,16 +237,21 @@ static int draw_char(canvas *c, int x, int y, int scale, uint32_t rgba, uint32_t
     const cached_glyph *g;
 
     if (cp < 0x80) {
-        if (c) {
-            glyph(c, x + 1, y + 1, scale, SHADOW, (unsigned char)cp);
-            glyph(c, x, y, scale, rgba, (unsigned char)cp);
+        if ((g = ascii_lookup(cp, scale)) == NULL) {
+            if (c) {
+                glyph(c, x + 1, y + 1, scale, SHADOW, (unsigned char)cp);
+                glyph(c, x, y, scale, rgba, (unsigned char)cp);
+            }
+            return 8 * scale;
         }
-        return 8 * scale;
+    } else {
+        g = lookup(cp, text_px(scale));
     }
-    if ((g = lookup(cp, 8 * scale)) != NULL) {
+    if (g) {
         if (c) {
-            draw_alpha(c, x + 1, y + 1, SHADOW, g);
-            draw_alpha(c, x, y, rgba, g);
+            int up = (g->px - 8 * scale) / 2;
+            draw_alpha(c, x + 1, y + 1 - up, SHADOW, g);
+            draw_alpha(c, x, y - up, rgba, g);
         }
         return g->advance;
     }
