@@ -2683,9 +2683,10 @@ void library_close(library *l)
         release_devices(l);
     for (int i = 0; i < CACHE_N; i++)
         free_media(&l->cache[i]);
-    for (int i = 0; i < l->scan_total; i++)
+    for (int i = 0; i < l->scan_total; i++) {
         free(l->discs[i].poster);
         free(l->discs[i].icon0);
+    }
     free(l->discs);
     plat_cond_destroy(l->cache_cond);
     plat_mutex_destroy(l->cache_lock);
